@@ -16,6 +16,17 @@ export type LlmProxyInput = {
     body?: unknown;
 };
 
+type GateVerifier = (gateCookie: string, sessionToken: string) => Promise<boolean>;
+
+export async function isAuthorizedLlmProxySession(
+    sessionToken: string,
+    gateCookie: string,
+    verifyGate: GateVerifier,
+): Promise<boolean> {
+    if (!sessionToken || !gateCookie) return false;
+    return verifyGate(gateCookie, sessionToken);
+}
+
 export function validateLlmProxyUrl(rawUrl: unknown): URL {
     if (typeof rawUrl !== "string" || rawUrl.length > 2048) {
         throw new Error("Invalid proxy URL");

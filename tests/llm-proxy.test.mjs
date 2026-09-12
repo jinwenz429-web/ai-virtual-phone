@@ -5,16 +5,30 @@ import {
     fetchLlmRequest,
     shouldProxyLlmConfig,
 } from "../lib/llm-http.ts";
-import {
+import * as llmProxyPolicy from "../lib/server/llm-proxy-policy.ts";
+
+const {
     buildLlmProxyRequest,
     buildLlmProxyResponse,
     validateLlmProxyUrl,
-} from "../lib/server/llm-proxy-policy.ts";
+} = llmProxyPolicy;
 
 test("only user-configured API base URLs use the same-origin proxy", () => {
     assert.equal(shouldProxyLlmConfig({ provider: "Custom", baseUrl: "https://wawapii.com/v1" }), true);
     assert.equal(shouldProxyLlmConfig({ provider: "Custom", baseUrl: "https://api.sora.example/v1" }), false);
     assert.equal(shouldProxyLlmConfig({ provider: "OpenAI" }), false);
+});
+
+test("proxy access requires a valid gate cookie tied to the account session", async () => {
+    assert.equal(typeof llmProxyPolicy.isAuthorizedLlmProxySession, "function");
+    const { isAuthorizedLlmProxySession } = llmProxyPolicy;
+    const verify = async (gateCookie, sessionToken) => (
+        gateCookie === "valid-gate" && sessionToken === "valid-session"
+    );
+
+    assert.equal(await isAuthorizedLlmProxySession("", "", verify), false);
+    assert.equal(await isAuthorizedLlmProxySession("valid-session", "wrong-gate", verify), false);
+    assert.equal(await isAuthorizedLlmProxySession("valid-session", "valid-gate", verify), true);
 });
 
 test("client proxy wrapper sends one same-origin request and keeps the upstream method", async () => {

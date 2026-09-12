@@ -1,15 +1,27 @@
 import { NextRequest, NextResponse } from "next/server";
 
+import { ACCOUNT_GATE_COOKIE, ACCOUNT_SESSION_COOKIE } from "@/lib/account-cookie-constants";
+import { verifyAccountGateCookieValue } from "@/lib/account-gate-cookie";
 import { proxyFetch } from "@/lib/proxy-fetch";
 import {
     buildLlmProxyRequest,
     buildLlmProxyResponse,
+    isAuthorizedLlmProxySession,
     type LlmProxyInput,
 } from "@/lib/server/llm-proxy-policy";
 
 export const maxDuration = 120;
 
 export async function POST(request: NextRequest): Promise<Response> {
+    const sessionToken = request.cookies.get(ACCOUNT_SESSION_COOKIE)?.value ?? "";
+    const gateCookie = request.cookies.get(ACCOUNT_GATE_COOKIE)?.value ?? "";
+    if (!await isAuthorizedLlmProxySession(sessionToken, gateCookie, verifyAccountGateCookieValue)) {
+        return NextResponse.json(
+            { ok: false, error: "请先登录账号。" },
+            { status: 401, headers: { "Cache-Control": "no-store" } },
+        );
+    }
+
     let input: LlmProxyInput;
     try {
         input = await request.json();
