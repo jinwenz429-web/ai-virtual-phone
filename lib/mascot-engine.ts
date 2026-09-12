@@ -24,6 +24,7 @@ import {
     type LlmToolCall,
 } from "./llm-provider-adapter";
 import { sendLLMToolStreamRequest, type LLMToolRequestResult } from "./chat-engine";
+import { fetchLlmPayload } from "./llm-http";
 
 function requireMascotApiConfig() {
     const apiConfig = resolveAuxiliaryApiConfig("mascotApiConfigId");
@@ -418,12 +419,7 @@ async function streamMascotProviderRequest(
     let reasoning = "";
 
     try {
-        const response = await fetch(request.url, {
-            method: "POST",
-            headers: request.headers,
-            body: JSON.stringify(request.body),
-            signal: llmAbort.signal,
-        });
+        const response = await fetchLlmPayload(request, { signal: llmAbort.signal });
         if (!response.ok) throw new Error(`API Stream ${response.status}: ${await response.text()}`);
         if (!response.body) throw new Error("流式响应没有 body。");
 
@@ -565,12 +561,7 @@ async function callMascotText(
         await options?.callbacks?.onStreamFallback?.(formatErrorMessage(streamError));
 
         const request = buildProviderRequest(apiConfig, null, messages);
-        const response = await fetch(request.url, {
-            method: "POST",
-            headers: request.headers,
-            body: JSON.stringify(request.body),
-            signal: options?.signal,
-        });
+        const response = await fetchLlmPayload(request, { signal: options?.signal });
         if (!response.ok) throw new Error(`API ${response.status}: ${await response.text()}`);
         const data = await response.json();
         const parsed = parseProviderResponse(request.providerKind, data);
@@ -648,12 +639,7 @@ async function callMascotNative(
             await options?.callbacks?.onStreamFallback?.(formatErrorMessage(streamError));
 
             const fallbackRequest = buildProviderRequest(apiConfig, null, messages, { tools });
-            const response = await fetch(fallbackRequest.url, {
-                method: "POST",
-                headers: fallbackRequest.headers,
-                body: JSON.stringify(fallbackRequest.body),
-                signal: options?.signal,
-            });
+            const response = await fetchLlmPayload(fallbackRequest, { signal: options?.signal });
             if (!response.ok) throw new Error(`API ${response.status}: ${await response.text()}`);
             const data = await response.json();
             const parsed = parseProviderResponse(fallbackRequest.providerKind, data);

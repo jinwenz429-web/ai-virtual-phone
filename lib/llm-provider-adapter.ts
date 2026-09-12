@@ -9,6 +9,7 @@ import {
     stripHallucinatedTimestamps,
 } from "./api-helpers";
 import { resolveEnabledGenerationParameters } from "./generation-parameters";
+import { shouldProxyLlmConfig } from "./llm-http";
 
 export type LlmProviderKind = "openai-compatible" | "anthropic" | "gemini";
 export type NativeToolProtocol = "openai-compatible" | "anthropic" | "gemini";
@@ -39,7 +40,7 @@ export type LlmRequestPayload = {
     body: Record<string, unknown>;
     providerKind: LlmProviderKind;
     messagesForLog: { role: string; content: string | LLMContentPart[]; marker?: string }[];
-    /** 需要经本站 /api/llm-proxy 服务端转发（OpenCode 网关未开放浏览器 CORS 时置 true） */
+    /** 需要经本站 /api/llm-proxy 服务端转发（上游未开放浏览器 CORS 时置 true） */
     serverProxy?: boolean;
 };
 
@@ -258,13 +259,14 @@ export function buildProviderRequest(
     const guardedMessages = config.enableImageRecognition === true ? messages : stripVisionParts(messages);
     const providerMessages = ensureProviderHasUserMessage(normalizeNativeToolMessageAdjacency(guardedMessages));
 
-    if (providerKind === "anthropic") {
-        return buildAnthropicRequest(config, preset, baseUrl, providerMessages, options);
-    }
-    if (providerKind === "gemini") {
-        return buildGeminiRequest(config, preset, baseUrl, providerMessages, options);
-    }
-    return buildOpenAICompatibleRequest(config, preset, baseUrl, providerMessages, options);
+    const request = providerKind === "anthropic"
+        ? buildAnthropicRequest(config, preset, baseUrl, providerMessages, options)
+        : providerKind === "gemini"
+            ? buildGeminiRequest(config, preset, baseUrl, providerMessages, options)
+            : buildOpenAICompatibleRequest(config, preset, baseUrl, providerMessages, options);
+
+    if (shouldProxyLlmConfig(config)) request.serverProxy = true;
+    return request;
 }
 
 // 剥离逻辑收敛到 api-helpers（更底层，微信助手运行时也照抄同一份正则）；

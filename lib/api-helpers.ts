@@ -4,6 +4,7 @@
 
 import type { ApiConfig } from "./settings-types";
 import { pushApiLog } from "./api-log-store";
+import { fetchLlmRequest, shouldProxyLlmConfig } from "./llm-http";
 
 const SIMPLE_ANTHROPIC_AUTO_MAX_TOKENS = 8192;
 
@@ -160,7 +161,11 @@ export async function simpleLLMCall(
         const bodyTokenEstimate = Math.ceil(bodySize / 3);
         console.log("[simpleLLMCall] Request:", { url: fetchUrl.slice(0, 80), bodySize, bodyTokenEstimate, model: config.defaultModel });
 
-        const res = await fetch(fetchUrl, { method: "POST", headers, body, signal: options?.signal });
+        const res = await fetchLlmRequest(
+            fetchUrl,
+            { method: "POST", headers, body },
+            { signal: options?.signal, serverProxy: shouldProxyLlmConfig(config) },
+        );
 
         if (!res.ok) {
             const errText = await res.text().catch(() => "");

@@ -10,6 +10,7 @@ import { ConfirmDialog } from "@/components/ui/modal";
 import { Toggle, Input } from "@/components/ui/form";
 import { Alert } from "@/components/ui/feedback";
 import { determineBaseUrl, simpleLLMCall } from "@/lib/api-helpers";
+import { fetchLlmRequest, shouldProxyLlmConfig } from "@/lib/llm-http";
 
 const DEFAULT_CONFIGS: ApiConfig[] = [
     {
@@ -134,7 +135,11 @@ export function ApiSettings() {
             const headers: Record<string, string> = { "Content-Type": "application/json" };
             if (!isGoogleNative) headers["Authorization"] = `Bearer ${config.apiKey}`;
 
-            const response = await fetch(url, { method: "GET", headers });
+            const response = await fetchLlmRequest(
+                url,
+                { method: "GET", headers },
+                { serverProxy: shouldProxyLlmConfig(config) },
+            );
 
             if (!response.ok) {
                 const errorData = await response.json().catch(() => ({}));
