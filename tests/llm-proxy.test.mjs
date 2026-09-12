@@ -31,6 +31,12 @@ test("proxy access requires a valid gate cookie tied to the account session", as
     assert.equal(await isAuthorizedLlmProxySession("valid-session", "valid-gate", verify), true);
 });
 
+test("self-hosted proxy access does not require account cookies", async () => {
+    const verify = async () => false;
+
+    assert.equal(await llmProxyPolicy.isAuthorizedLlmProxySession("", "", verify, true), true);
+});
+
 test("client proxy wrapper sends one same-origin request and keeps the upstream method", async () => {
     const calls = [];
     const originalFetch = globalThis.fetch;
