@@ -278,6 +278,7 @@ export async function armFollowUpBailout(
         // 但标记式快捷动作云端是支持的（push-generate 解析【快捷动作：名称】），
         // 所以照常注入动作目录，别让角色在离线追问里以为自己什么都做不了。
         maybeAppendShortcutCapability(llmMessages, { continuationAvailable: true });
+        const weixinBotId = maybeAppendWeixinChannel(llmMessages, session.contactId);
         const request = buildProviderRequest(config, preset, toLlmRequestMessages(llmMessages));
         const shortcutContinuation = buildOfflineShortcutContinuation(llmMessages, messages => {
             const req = buildProviderRequest(config, preset, toLlmRequestMessages(messages));
@@ -288,35 +289,26 @@ export async function armFollowUpBailout(
         const latestSchedule = loadFollowUpSchedule(sessionId);
         if (!latestSchedule || latestSchedule.count !== prevCount || Math.abs(latestSchedule.fireAt - fireAt) > 1000) return;
 
-        await pushJobsFetch({
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                triggerKey: `followup:${sessionId}:${count}`,
-                kind: "followup",
-                executeAt: new Date(fireAt + FOLLOWUP_BAILOUT_GRACE_MS).toISOString(),
-                payload: {
-                    request: {
-                        url: request.url,
-                        headers: request.headers,
-                        body: request.body,
-                        providerKind: request.providerKind,
-                    },
-                    notify: { title: character.name, url: "/" },
-                    ...(shortcutContinuation ? { shortcutContinuation } : {}),
-                    merge: {
-                        sessionId,
-                        followUpIndex: count,
-                        prevCount,
-                        regexes,
-                        characterName: character.name,
-                        userName: userIdentity?.name ?? "用户",
-                        appId: "chat",
-                        appTags: ["chat", "text", "followup"],
-                        followUpCount: count,
-                    },
-                },
-            }),
+        await postBailoutJob({
+            triggerKey: `followup:${sessionId}:${count}`,
+            kind: "followup",
+            executeAtMs: fireAt + FOLLOWUP_BAILOUT_GRACE_MS,
+            request,
+            notifyTitle: character.name,
+            weixinBotId,
+            forceWeixin: Boolean(weixinBotId),
+            shortcutContinuation,
+            merge: {
+                sessionId,
+                followUpIndex: count,
+                prevCount,
+                regexes,
+                characterName: character.name,
+                userName: userIdentity?.name ?? "用户",
+                appId: "chat",
+                appTags: ["chat", "text", "followup"],
+                followUpCount: count,
+            },
         });
     } catch (err) {
         console.warn("[PushBailout] arm failed:", err);
@@ -332,6 +324,7 @@ async function postBailoutJob(input: {
     notifyTitle: string;
     merge: Record<string, unknown>;
     weixinBotId?: string;
+    forceWeixin?: boolean;
     shortcutContinuation?: OfflineShortcutContinuation | null;
 }): Promise<boolean> {
     const response = await pushJobsFetch({
@@ -349,7 +342,9 @@ async function postBailoutJob(input: {
                     providerKind: input.request.providerKind,
                 },
                 notify: { title: input.notifyTitle, url: "/" },
-                ...(input.weixinBotId ? { weixin: { botId: input.weixinBotId } } : {}),
+                ...(input.weixinBotId
+                    ? { weixin: { botId: input.weixinBotId, ...(input.forceWeixin ? { force: true } : {}) } }
+                    : {}),
                 ...(input.shortcutContinuation ? { shortcutContinuation: input.shortcutContinuation } : {}),
                 merge: input.merge,
             },
@@ -451,6 +446,7 @@ export async function armIdleReconnectBailout(rule: IdleReconnectRule): Promise<
             request,
             notifyTitle: character.name,
             weixinBotId,
+            forceWeixin: Boolean(weixinBotId),
             shortcutContinuation,
             merge: {
                 sessionId: session.id,
@@ -512,6 +508,7 @@ export async function armTimedWakeBailout(schedule: TimedWakeSchedule): Promise<
             request,
             notifyTitle: character.name,
             weixinBotId,
+            forceWeixin: Boolean(weixinBotId),
             shortcutContinuation,
             merge: {
                 sessionId: session.id,
@@ -568,6 +565,7 @@ export async function armPeriodCareBailouts(): Promise<void> {
                     { appTags: ["chat", "text", "period_care"], periodCareContext: event.context },
                 );
                 maybeAppendShortcutCapability(llmMessages, { continuationAvailable: true });
+                const weixinBotId = maybeAppendWeixinChannel(llmMessages, session.contactId);
                 const request = buildProviderRequest(apiConfig, preset, toLlmRequestMessages(llmMessages));
                 const shortcutContinuation = buildOfflineShortcutContinuation(llmMessages, messages => {
                     const req = buildProviderRequest(apiConfig, preset, toLlmRequestMessages(messages));
@@ -579,6 +577,8 @@ export async function armPeriodCareBailouts(): Promise<void> {
                     executeAtMs,
                     request,
                     notifyTitle: characterName,
+                    weixinBotId,
+                    forceWeixin: Boolean(weixinBotId),
                     shortcutContinuation,
                     merge: {
                         sessionId: session.id,
