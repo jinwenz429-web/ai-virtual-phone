@@ -5,7 +5,6 @@
 // 动作目录由 push-bridge-sync 同步到 push_bridge_config.shortcut_actions，
 // 仅个人云激活且现实桥能力开启时生效（站点线不注入、不同步）。
 
-import { getWeixinCloudDeployedAt } from "./cloud-deploy-status";
 import { getInternalCapability, REALITY_BRIDGE_CAPABILITY_ID } from "./internal-capability-storage";
 import type { LLMMessage } from "./llm-prompt-assembler";
 import { isPersonalPushCloudActive } from "./personal-push-cloud";
@@ -131,10 +130,9 @@ export function listOfflineShortcutActions(): OfflineShortcutAction[] {
   }));
 }
 
-/** 角色离线时可用的微信送达通道：个人云激活 + 微信云助手已部署 + 角色绑定了 bot。 */
+/** 角色离线时可用的微信送达通道：个人云激活 + 角色绑定了已启用的 bot。 */
 export function offlineWeixinBotIdFor(characterId: string): string {
   if (typeof window === "undefined" || !isPersonalPushCloudActive()) return "";
-  if (!getWeixinCloudDeployedAt()) return "";
   const bot = loadWeixinBots().find(entry => entry.enabled && entry.characterId === characterId);
   return bot?.id ?? "";
 }
