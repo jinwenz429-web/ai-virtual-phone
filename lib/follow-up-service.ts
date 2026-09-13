@@ -319,10 +319,11 @@ async function saveBackgroundCompletionRounds(
     followUpIndex: number | undefined,
     contextMessages: ChatMessage[],
     options?: { senderCharacterId?: string; senderName?: string; silent?: boolean },
-): Promise<{ hasVisible: boolean; newCount: number; stateValues: StateValue[] }> {
+): Promise<{ hasVisible: boolean; newCount: number; stateValues: StateValue[]; savedMessages: ChatMessage[] }> {
     let hasVisible = false;
     let newCount = currentCount;
     let stateValues: StateValue[] = [];
+    const savedMessages: ChatMessage[] = [];
     for (const round of rounds) {
         const result = await parseAndSaveResponse(
             round.text,
@@ -346,8 +347,18 @@ async function saveBackgroundCompletionRounds(
         if (result.stateValues.length > 0) {
             stateValues = result.stateValues;
         }
+        savedMessages.push(...result.savedMessages);
     }
-    return { hasVisible, newCount, stateValues };
+    return { hasVisible, newCount, stateValues, savedMessages };
+}
+
+async function sendProactiveMessagesToWeixin(messages: ChatMessage[]): Promise<void> {
+    try {
+        const { sendLocalWeixinProactiveMessages } = await import("./weixin-cloud-sync");
+        await sendLocalWeixinProactiveMessages(messages);
+    } catch (error) {
+        console.warn("[WeixinProactive] send failed:", error);
+    }
 }
 
 function pollSchedules() {
@@ -502,12 +513,13 @@ async function fireFollowUp(sched: { sessionId: string; count: number; delaySec?
             return;
         }
 
-        const { hasVisible, newCount, stateValues } = await saveBackgroundCompletionRounds(rounds, session.id, sched.count, count, latestMessages);
+        const { hasVisible, newCount, stateValues, savedMessages } = await saveBackgroundCompletionRounds(rounds, session.id, sched.count, count, latestMessages);
         console.log(`[FollowUp] Result: hasVisible=${hasVisible}, newCount=${newCount}`);
 
         // 本地已完成这一轮，撤销服务端对应的兜底预约（只撤本轮的精确键，
         // 不用前缀删，避免误删 scheduleFollowUp 马上要挂的下一轮）
         cancelFollowUpBailout(session.id, count);
+        await sendProactiveMessagesToWeixin(savedMessages);
 
         if (hasVisible && newCount < MAX_FOLLOW_UPS) {
             scheduleFollowUp(session.id, newCount, stateValues);
@@ -603,13 +615,14 @@ async function fireIdleReconnect(rule: IdleReconnectRule, lastUserAt: number) {
             return;
         }
 
-        const { hasVisible, stateValues } = await saveBackgroundCompletionRounds(
+        const { hasVisible, stateValues, savedMessages } = await saveBackgroundCompletionRounds(
             rounds,
             session.id,
             0,
             undefined,
             latestMessages,
         );
+        await sendProactiveMessagesToWeixin(savedMessages);
         markIdleReconnectFired(rule.id, Date.now());
         if (hasVisible) scheduleFollowUp(session.id, 0, stateValues);
         window.dispatchEvent(new CustomEvent("followup-fired", { detail: { sessionId: session.id } }));
@@ -662,13 +675,14 @@ async function fireTimedWake(sched: TimedWakeSchedule) {
             return;
         }
 
-        const { hasVisible, stateValues } = await saveBackgroundCompletionRounds(
+        const { hasVisible, stateValues, savedMessages } = await saveBackgroundCompletionRounds(
             rounds,
             session.id,
             0,
             undefined,
             latestMessages,
         );
+        await sendProactiveMessagesToWeixin(savedMessages);
         console.log(`[TimedWake] Result: hasVisible=${hasVisible}`);
 
         if (hasVisible) {
@@ -726,7 +740,7 @@ async function fireMenstrualPeriodCare(input: {
             return;
         }
 
-        const { hasVisible, stateValues } = await saveBackgroundCompletionRounds(
+        const { hasVisible, stateValues, savedMessages } = await saveBackgroundCompletionRounds(
             rounds,
             session.id,
             0,
@@ -739,6 +753,7 @@ async function fireMenstrualPeriodCare(input: {
             cycleKey: input.event.cycleKey,
         });
         cancelBailoutKey(`periodcare:${input.characterId}:${input.event.cycleKey}`);
+        await sendProactiveMessagesToWeixin(savedMessages);
         console.log(`[PeriodCare] Result: hasVisible=${hasVisible}`);
 
         if (hasVisible) {
@@ -892,7 +907,7 @@ export async function parseAndSaveResponse(
          *  （可见灰条），与小手机内直接调用快捷动作的显示一致 */
         shortcutMarker?: { text: string; insertAt: number; name: string };
     },
-): Promise<{ hasVisible: boolean; newCount: number; stateValues: StateValue[] }> {
+): Promise<{ hasVisible: boolean; newCount: number; stateValues: StateValue[]; savedMessages: ChatMessage[] }> {
     const responseBatchId = options?.responseBatchId || createResponseBatchId();
     const rawResponseText = options?.rawResponseText ?? rawText;
     const reasoningText = options?.reasoningText;
@@ -1015,7 +1030,7 @@ export async function parseAndSaveResponse(
         if (triggerCall && typeof window !== "undefined") {
             window.dispatchEvent(new CustomEvent("ai-call-trigger", { detail: { sessionId, type: triggerCall } }));
         }
-        return { hasVisible: false, newCount: MAX_FOLLOW_UPS, stateValues };
+        return { hasVisible: false, newCount: MAX_FOLLOW_UPS, stateValues, savedMessages: [] };
     }
 
     const savedMessages: ChatMessage[] = [];
@@ -1128,5 +1143,5 @@ export async function parseAndSaveResponse(
         window.dispatchEvent(new CustomEvent("ai-call-trigger", { detail: { sessionId, type: triggerCall } }));
     }
 
-    return { hasVisible: true, newCount: currentCount + 1, stateValues };
+    return { hasVisible: true, newCount: currentCount + 1, stateValues, savedMessages };
 }

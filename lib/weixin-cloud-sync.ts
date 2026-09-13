@@ -1642,6 +1642,39 @@ export async function syncLocalWeixinCloudMessageToCloud(message: ChatMessage): 
   return true;
 }
 
+/** 把前台生成的主动消息直接送到该角色绑定的真实微信；本地消息 id 用于回流去重。 */
+export async function sendLocalWeixinProactiveMessages(messages: ChatMessage[]): Promise<boolean> {
+  const outgoing = messages.filter(message =>
+    message.role === "assistant"
+    && Boolean(message.content.trim())
+    && shouldUploadLocalWeixinMessage(message),
+  );
+  if (outgoing.length === 0 || loadWeixinCloudSyncConfig().enabled !== true) return false;
+
+  const target = resolveWeixinCloudMessageTarget(outgoing[0]);
+  if (!target) return false;
+
+  const token = await ensureWeixinCloudCronSecret();
+  const response = await fetch(buildWeixinCloudAssistantFunctionUrl(), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      action: "send-text",
+      token,
+      bucket: CLOUD_BACKUP_BUCKET,
+      bot: target.bot.id,
+      text: outgoing.map(message => message.content.trim()).join("\n\n"),
+      replyAfterLocalMessageId: outgoing[0].id,
+      replyAfterCreatedAt: outgoing[0].createdAt,
+    }),
+  });
+  const data = await response.json().catch(() => null) as { ok?: boolean; error?: string } | null;
+  if (!response.ok || data?.ok !== true) {
+    throw new Error(data?.error || `微信主动发送返回 HTTP ${response.status}`);
+  }
+  return true;
+}
+
 /**
  * 长按编辑一条从微信拉回来的回复后，把编辑结果就地覆盖回同一条云消息。
  *
