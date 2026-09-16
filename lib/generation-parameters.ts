@@ -19,13 +19,21 @@ export function isGenerationParameterKey(value: unknown): value is GenerationPar
 }
 
 /**
+ * Requests without a preset use a portable baseline shared by provider adapters.
  * Old presets did not store an allow-list. Derive the list from the exact legacy
  * request behavior so simply upgrading does not add or remove request fields.
  */
 export function resolveEnabledGenerationParameters(
     preset: PresetConfig | null,
 ): Set<GenerationParameterKey> {
-    if (preset?.enabled_generation_parameters) {
+    if (!preset) {
+        return new Set<GenerationParameterKey>([
+            "temperature",
+            "top_p",
+        ]);
+    }
+
+    if (preset.enabled_generation_parameters) {
         return new Set(preset.enabled_generation_parameters.filter(isGenerationParameterKey));
     }
 
@@ -35,7 +43,6 @@ export function resolveEnabledGenerationParameters(
         "frequency_penalty",
         "presence_penalty",
     ]);
-    if (!preset) return enabled;
     if (preset.top_k > 0) enabled.add("top_k");
     if ((preset.min_p ?? 0) > 0) enabled.add("min_p");
     if ((preset.top_a ?? 0) > 0) enabled.add("top_a");
