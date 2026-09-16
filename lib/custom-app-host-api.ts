@@ -515,11 +515,15 @@ function normalizeCustomAppNativeToolCalls(value: unknown): NativeToolCallRecord
     const name = cleanText(entry.name ?? entry.toolName, 160);
     if (!id || !name) return null;
     const args = asRecord(entry.args ?? entry.arguments);
+    const extraContent = Object.prototype.hasOwnProperty.call(entry, "extraContent")
+      ? entry.extraContent
+      : entry.extra_content;
     const thoughtSignature = cleanUnboundedText(entry.thoughtSignature);
     return {
       id,
       name,
       args,
+      ...(extraContent !== undefined ? { extraContent } : {}),
       ...(thoughtSignature ? { thoughtSignature } : {}),
     };
   }).filter(Boolean) as NativeToolCallRecord[];
@@ -1985,6 +1989,7 @@ export async function generateCustomAppText(app: InstalledCustomApp, record: Rec
           id: call.id,
           name: call.name,
           args: asRecord(call.args),
+          ...(call.extraContent !== undefined ? { extraContent: call.extraContent } : {}),
           ...(call.thoughtSignature ? { thoughtSignature: call.thoughtSignature } : {}),
         })),
         nativeToolReasoning: reasoning,

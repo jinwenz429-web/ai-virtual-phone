@@ -1034,6 +1034,7 @@ type StreamToolCallDraft = {
     name?: string;
     argsText: string;
     args?: Record<string, unknown>;
+    extraContent?: unknown;
     thoughtSignature?: string;
 };
 
@@ -1044,6 +1045,7 @@ function mergeToolCallDelta(drafts: Map<number, StreamToolCallDraft>, delta: Llm
         name: delta.name ?? current.name,
         argsText: current.argsText + (delta.argsText ?? ""),
         args: delta.args ?? (delta.argsText ? undefined : current.args),
+        extraContent: delta.extraContent !== undefined ? delta.extraContent : current.extraContent,
         thoughtSignature: delta.thoughtSignature ?? current.thoughtSignature,
     });
 }
@@ -1073,6 +1075,7 @@ function finalizeStreamToolCalls(drafts: Map<number, StreamToolCallDraft>): { ca
             name: draft.name,
             args: args as Record<string, unknown>,
         };
+        if (draft.extraContent !== undefined) call.extraContent = draft.extraContent;
         if (draft.thoughtSignature) call.thoughtSignature = draft.thoughtSignature;
         calls.push(call);
     }

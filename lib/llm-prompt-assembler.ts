@@ -19,7 +19,7 @@ import { formatShoppingPaymentRequestHistory } from "./shopping-payment-request"
 import { buildGroupAdminBracketText } from "./group-admin";
 
 export type LLMMessageRole = "system" | "user" | "assistant" | "tool";
-export type LLMToolCallPayload = { id: string; name: string; args: Record<string, unknown>; thoughtSignature?: string };
+export type LLMToolCallPayload = { id: string; name: string; args: Record<string, unknown>; extraContent?: unknown; thoughtSignature?: string };
 
 export type LLMContentPart =
     | { type: "text"; text: string }
@@ -227,6 +227,7 @@ function getValidNativeToolCalls(msg: ChatMessage, nativeResultIds: Set<string>)
             id: call.id,
             name: call.name,
             args: call.args,
+            ...(call.extraContent !== undefined ? { extraContent: call.extraContent } : {}),
             ...(call.thoughtSignature ? { thoughtSignature: call.thoughtSignature } : {}),
         }));
 }
