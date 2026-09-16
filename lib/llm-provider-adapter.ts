@@ -24,6 +24,8 @@ export type LlmToolCall = {
     id: string;
     name: string;
     args: Record<string, unknown>;
+    /** Provider-specific OpenAI-compatible tool-call metadata, replayed unchanged when present. */
+    extraContent?: unknown;
     /** Gemini 2.5+ multi-turn function calling 需要回传这个签名才能保持上下文一致性 */
     thoughtSignature?: string;
 };
@@ -65,6 +67,7 @@ export type LlmToolCallDelta = {
     name?: string;
     argsText?: string;
     args?: Record<string, unknown>;
+    extraContent?: unknown;
     thoughtSignature?: string;
 };
 
@@ -510,6 +513,7 @@ function buildOpenAICompatibleRequest(
                             name: call.name,
                             arguments: JSON.stringify(call.args),
                         },
+                        ...(call.extraContent !== undefined ? { extra_content: call.extraContent } : {}),
                     })),
                 };
                 if (message.reasoning && shouldEchoReasoningContent(config)) {
@@ -775,13 +779,14 @@ function extractOpenAICompatibleText(data: {
 }
 
 function parseOpenAIToolCall(value: unknown): LlmToolCall {
-    const call = value as { id?: string; function?: { name?: string; arguments?: string } };
+    const call = value as { id?: string; function?: { name?: string; arguments?: string }; extra_content?: unknown };
     const name = String(call.function?.name ?? "");
     const argsText = String(call.function?.arguments ?? "{}");
     return {
         id: String(call.id || `tool_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
         name,
         args: parseStrictArgs(argsText),
+        ...(call.extra_content !== undefined ? { extraContent: call.extra_content } : {}),
     };
 }
 
@@ -867,12 +872,13 @@ function parseOpenAICompatibleStreamDelta(data: unknown): LlmStreamDelta {
     const delta = d.choices?.[0]?.delta;
     const toolCallDeltas = Array.isArray(delta?.tool_calls)
         ? delta.tool_calls.map((value, fallbackIndex) => {
-            const item = value as { index?: number; id?: string; function?: { name?: string; arguments?: string } };
+            const item = value as { index?: number; id?: string; function?: { name?: string; arguments?: string }; extra_content?: unknown };
             return {
                 index: typeof item.index === "number" ? item.index : fallbackIndex,
                 id: item.id,
                 name: item.function?.name,
                 argsText: item.function?.arguments,
+                ...(item.extra_content !== undefined ? { extraContent: item.extra_content } : {}),
             };
         })
         : undefined;

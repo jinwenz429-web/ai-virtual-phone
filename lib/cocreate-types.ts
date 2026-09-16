@@ -12,7 +12,7 @@ export type CoCreateMessage = {
   chapterId?: string;
   promptHidden?: boolean;
   rawResponseText?: string;
-  nativeToolCalls?: { id: string; name: string; args: Record<string, unknown> }[];
+  nativeToolCalls?: { id: string; name: string; args: Record<string, unknown>; extraContent?: unknown; thoughtSignature?: string }[];
   nativeToolResult?: { toolCallId: string; name: string; content: string };
   nativeToolReasoning?: string;
   nativeToolOpenRouterReasoningDetails?: unknown[];
