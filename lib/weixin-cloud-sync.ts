@@ -86,10 +86,24 @@ const WEIXIN_CLOUD_HISTORY_HEAD_TOKEN = "__AI_PHONE_WX_SLOT_HEAD__";
 const WEIXIN_CLOUD_MAX_DEPTH_SLOTS = 48;
 const WEIXIN_CLOUD_CHAT_APP_TAGS = ["chat", "text"];
 const DEFAULT_MESSAGE_LIMIT = 80;
-const REALTIME_PULL_INTERVAL_MS = 8000;
+export const WEIXIN_CLOUD_REALTIME_PULL_INTERVAL_MS = 30_000;
+const REALTIME_PULL_INTERVAL_MS = WEIXIN_CLOUD_REALTIME_PULL_INTERVAL_MS;
+const WEIXIN_CLOUD_PULL_QUOTA_BACKOFF_MS = 30 * 60 * 1000;
+const WEIXIN_CLOUD_PULL_FAILURE_BACKOFF_MS = [60_000, 2 * 60_000, 5 * 60_000, 10 * 60_000] as const;
 const LOCAL_UPLOAD_FLUSH_DELAY_MS = 500;
 const RUNTIME_CONFIG_SYNC_DEBOUNCE_MS = 3000;
 const RUNTIME_AUTO_SYNC_THROTTLE_MS = 60 * 60 * 1000;
+
+export function getWeixinCloudPullBackoffMs(error: unknown, consecutiveFailures: number): number {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/(?:^|\D)402(?:\D|$)|payment required/i.test(message)) {
+    return WEIXIN_CLOUD_PULL_QUOTA_BACKOFF_MS;
+  }
+  const failureIndex = Math.max(0, Math.floor(consecutiveFailures) - 1);
+  return WEIXIN_CLOUD_PULL_FAILURE_BACKOFF_MS[
+    Math.min(failureIndex, WEIXIN_CLOUD_PULL_FAILURE_BACKOFF_MS.length - 1)
+  ];
+}
 
 registerKvMigration(WEIXIN_CLOUD_CONFIG_KEY);
 
@@ -1409,11 +1423,24 @@ export function startWeixinCloudRealtimeSync(): () => void {
   // 启动、回前台、以及每 10 分钟做一次全量，兜历史坑
   const FULL_SCAN_INTERVAL_MS = 10 * 60 * 1000;
   let lastFullScanAt = 0;
+  let consecutivePullFailures = 0;
+  let pullBackoffUntil = 0;
+
+  const registerPullFailure = (error: unknown) => {
+    consecutivePullFailures += 1;
+    pullBackoffUntil = Date.now() + getWeixinCloudPullBackoffMs(error, consecutivePullFailures);
+  };
+
+  const resetPullBackoff = () => {
+    consecutivePullFailures = 0;
+    pullBackoffUntil = 0;
+  };
 
   const pullNow = async (force = false, deep = false) => {
     if (stopped || pullInFlight || !shouldRun()) return;
     if (!force && document.visibilityState !== "visible") return;
     const now = Date.now();
+    if (now < pullBackoffUntil) return;
     if (!force && now - lastPullAt < REALTIME_PULL_INTERVAL_MS - 500) return;
     lastPullAt = now;
     const scan = deep || now - lastFullScanAt >= FULL_SCAN_INTERVAL_MS ? "full" as const : "latest" as const;
@@ -1424,10 +1451,14 @@ export function startWeixinCloudRealtimeSync(): () => void {
         if (scan === "full") lastFullScanAt = Date.now();
         if (result.added > 0) dispatchPulledSessions(result.sessionIds);
         if (result.errors.length > 0) {
+          registerPullFailure(result.errors[0]);
           console.warn("[WeixinCloudSync] pull errors:", result.errors);
           emitWeixinSyncToast(`微信消息拉取失败：${result.errors[0]}`, { id: "weixin-pull", throttleMs: 30_000, duration: 4000 });
+        } else {
+          resetPullBackoff();
         }
       } catch (err) {
+        registerPullFailure(err);
         console.warn("[WeixinCloudSync] auto pull failed:", err);
         emitWeixinSyncToast(`微信消息拉取失败：${err instanceof Error ? err.message : String(err)}`, { id: "weixin-pull", throttleMs: 30_000, duration: 4000 });
       }
@@ -1572,6 +1603,7 @@ export function startWeixinCloudRealtimeSync(): () => void {
   };
 
   const onConfigChanged = () => {
+    resetPullBackoff();
     if (!shouldRun()) return;
     void pullNow(true);
     scheduleRuntimeSync();
