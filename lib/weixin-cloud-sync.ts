@@ -77,6 +77,7 @@ import { getStatusRegionConfig, isCustomStatusRegionActive } from "./chat-status
 const WEIXIN_CLOUD_CONFIG_KEY = "weixin_cloud_sync_config_v1";
 const WEIXIN_CLOUD_PREFIX = "weixin-cloud";
 const WEIXIN_CLOUD_INDEX_PATH = `${WEIXIN_CLOUD_PREFIX}/index.json`;
+const WEIXIN_CLOUD_MESSAGE_SIGNAL_PATH = `${WEIXIN_CLOUD_PREFIX}/state/message-signal.json`;
 const WEIXIN_CLOUD_HISTORY_SLOT_TOKEN = "__AI_PHONE_WEIXIN_CLOUD_HISTORY_SLOT_V1__";
 /** v2 深度哨兵：__AI_PHONE_WX_SLOT_D<d>__ 标记「距离历史底部 d 条」的位置 */
 const WEIXIN_CLOUD_DEPTH_SLOT_PREFIX = "__AI_PHONE_WX_SLOT_D";
@@ -235,6 +236,8 @@ export type WeixinCloudPromptTemplate = {
 
 export type WeixinCloudRuntimeIndexItem = {
   botId: string;
+  /** 空闲轮询只需要 token，不必每分钟下载完整运行包。 */
+  botToken?: string;
   characterId: string;
   characterName: string;
   sessionId: string;
@@ -383,7 +386,7 @@ export type WeixinCloudAssistantHeartbeat = {
   stored?: number;
   sent?: number;
   elapsedMs?: number;
-  /** bucket = 正在使用小手机同步的最新核心；bundled = 使用函数内置版本 */
+  /** 当前云函数使用的核心来源；现行版本固定为 bundled。 */
   codeSource?: string;
 };
 
@@ -1048,6 +1051,7 @@ export async function syncWeixinBotRuntimeToCloud(
   await putObject(cloudConfig, path, json, "application/json");
   await updateRuntimeIndex(cloudConfig, {
     botId: snapshot.bot.id,
+    botToken: snapshot.bot.botToken,
     characterId: snapshot.character.id,
     characterName: snapshot.character.name,
     sessionId: snapshot.session.id,
@@ -1257,24 +1261,19 @@ export async function syncAllWeixinBotRuntimesToCloud(
   for (const bot of bots) {
     results.push(await syncWeixinBotRuntimeToCloud(bot.id, options));
   }
-  // 顺带把最新核心逻辑传到桶里：云函数的自更新加载器会优先使用它，
-  // 这样函数部署一次之后，逻辑更新随同步自动生效。失败不阻塞运行包同步。
-  await syncWeixinCloudFunctionCore(options?.cloudConfig).catch(() => {});
   return results;
 }
 
-const WEIXIN_CLOUD_CORE_CODE_PATH = `${WEIXIN_CLOUD_PREFIX}/function-core.mjs`;
-
-/** 把站点携带的 assistant-core.mjs 上传到备份桶，供云函数运行时动态加载。 */
-export async function syncWeixinCloudFunctionCore(cloudConfig?: CloudBackupConfig): Promise<void> {
-  if (typeof window === "undefined") return;
-  const config = cloudConfig ?? loadCloudBackupConfig();
-  if (!isCloudBackupConfigured(config)) return;
-  const res = await fetch("/weixin-local-assistant/assistant-core.mjs", { cache: "no-store" });
-  if (!res.ok) return;
-  const code = await res.text();
-  if (!code.includes("export async function pollOnce")) return;
-  await putObject(config, WEIXIN_CLOUD_CORE_CODE_PATH, code, "text/javascript");
+async function loadWeixinCloudMessageSignal(config: CloudBackupConfig): Promise<string | null> {
+  try {
+    const blob = await getObject(config, WEIXIN_CLOUD_MESSAGE_SIGNAL_PATH);
+    if (!blob) return null;
+    const value = JSON.parse(await blob.text()) as { botId?: unknown; externalId?: unknown; updatedAt?: unknown };
+    if (typeof value.updatedAt !== "string") return null;
+    return `${String(value.botId ?? "")}:${String(value.externalId ?? "")}:${value.updatedAt}`;
+  } catch {
+    return null;
+  }
 }
 
 export async function pullWeixinCloudMessagesFromCloud(
@@ -1425,6 +1424,8 @@ export function startWeixinCloudRealtimeSync(): () => void {
   let lastFullScanAt = 0;
   let consecutivePullFailures = 0;
   let pullBackoffUntil = 0;
+  let lastMessageSignal: string | null = null;
+  let messageSignalPrimed = false;
 
   const registerPullFailure = (error: unknown) => {
     consecutivePullFailures += 1;
@@ -1447,8 +1448,18 @@ export function startWeixinCloudRealtimeSync(): () => void {
     // 保存 promise 而不只是布尔：运行包同步要能等这一轮拉取落库（见 syncRuntimesNow）。
     const running = (async () => {
       try {
-        const result = await pullWeixinCloudMessagesFromCloud({ limitPerBot: 200, scan });
-        if (scan === "full") lastFullScanAt = Date.now();
+        const cloudConfig = loadCloudBackupConfig();
+        const messageSignal = await loadWeixinCloudMessageSignal(cloudConfig);
+        if (scan === "latest" && messageSignal && messageSignalPrimed && messageSignal === lastMessageSignal) {
+          resetPullBackoff();
+          return;
+        }
+        const result = await pullWeixinCloudMessagesFromCloud({ cloudConfig, limitPerBot: 200, scan });
+        if (result.errors.length === 0 && scan === "full") lastFullScanAt = Date.now();
+        if (result.errors.length === 0 && messageSignal) {
+          lastMessageSignal = messageSignal;
+          messageSignalPrimed = true;
+        }
         if (result.added > 0) dispatchPulledSessions(result.sessionIds);
         if (result.errors.length > 0) {
           registerPullFailure(result.errors[0]);

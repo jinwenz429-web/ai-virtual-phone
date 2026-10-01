@@ -5,14 +5,12 @@
 import { Buffer } from "node:buffer";
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
 
-// 云函数动态核心协议版本。wrapper 只加载版本一致的桶内核心，避免站点更新后
-// 继续执行旧桶里不认识微信快捷动作续跑的代码。
-export const WEIXIN_CORE_PROTOCOL_VERSION = 3;
 export const DEFAULT_BUCKET = "ai-phone-backup";
 export const DEFAULT_INTERVAL_SECONDS = 5;
 const INDEX_PATH = "weixin-cloud/index.json";
 const STATE_PREFIX = "weixin-cloud/state";
 const MESSAGE_PREFIX = "weixin-cloud/messages";
+const MESSAGE_SIGNAL_PATH = "weixin-cloud/state/message-signal.json";
 const INCOMING_MEDIA_PREFIX = "weixin-cloud/media";
 const INCOMING_IMAGE_MAX_BYTES = 6_000_000;
 const LOCK_PREFIX = "weixin-cloud/locks";
@@ -66,13 +64,34 @@ export async function pollOnce(env, targetBotId, options = {}) {
       skippedForDeadline += 1;
       continue;
     }
-    const runtime = await loadRuntimePackage(env, item);
+    let runtime = null;
+    const getRuntime = async () => {
+      if (!runtime) runtime = await loadRuntimePackage(env, item);
+      return runtime;
+    };
+
+    let pollingRuntime;
+    if (typeof item.botToken === "string" && item.botToken.trim()) {
+      pollingRuntime = {
+        bot: { id: item.botId, botToken: item.botToken },
+        character: { id: item.characterId, name: item.characterName || "" },
+        session: { id: item.sessionId },
+      };
+    } else {
+      pollingRuntime = await getRuntime();
+      const botToken = String(pollingRuntime.bot?.botToken || "").trim();
+      if (botToken) {
+        item.botToken = botToken;
+        await putObject(env, INDEX_PATH, JSON.stringify(index, null, 2), "application/json").catch(() => {});
+      }
+    }
+
     const state = await loadBotState(env, item.botId);
     const polledAt = new Date().toISOString();
 
     const data = await callIlinkJson(
       "/ilink/bot/getupdates",
-      runtime.bot?.botToken,
+      pollingRuntime.bot?.botToken,
       { get_updates_buf: state.getUpdatesBuf || "", base_info: BASE_INFO },
       "POST",
     );
@@ -95,7 +114,7 @@ export async function pollOnce(env, targetBotId, options = {}) {
     let storedMessages = 0;
     let lastStoredExternalId = "";
     for (const message of messages) {
-      const storedId = await storeIncomingMessage(env, runtime, message, polledAt);
+      const storedId = await storeIncomingMessage(env, pollingRuntime, message, polledAt);
       if (storedId) {
         storedMessages += 1;
         lastStoredExternalId = storedId;
@@ -109,12 +128,19 @@ export async function pollOnce(env, targetBotId, options = {}) {
       });
     }
 
-    const autoReply = await autoReplyPendingMessages(env, runtime, { force: options?.debug === true }).catch(async (err) => {
-      const message = errorMessage(err);
-      state.lastAutoReplyError = message;
-      await saveBotState(env, item.botId, state);
-      return { status: "failed", pending: 0, sent: 0, error: message };
-    });
+    let shouldLoadRuntime = options?.debug === true || storedMessages > 0;
+    if (!shouldLoadRuntime) {
+      const flag = await loadPendingFlag(env, item.botId).catch(() => null);
+      shouldLoadRuntime = !flag || flag.pending === true || reconcileScanDue(flag);
+    }
+    const autoReply = shouldLoadRuntime
+      ? await autoReplyPendingMessages(env, pollingRuntime, { force: options?.debug === true, getRuntime }).catch(async (err) => {
+        const message = errorMessage(err);
+        state.lastAutoReplyError = message;
+        await saveBotState(env, item.botId, state);
+        return { status: "failed", pending: 0, sent: 0, error: message };
+      })
+      : { status: "idle", pending: 0, sent: 0 };
     if (autoReply.status !== "failed") {
       state.lastAutoReplyAt = autoReply.sent > 0 ? new Date().toISOString() : state.lastAutoReplyAt;
       state.lastAutoReplyError = undefined;
@@ -192,6 +218,7 @@ async function storeIncomingMessage(env, runtime, raw, receivedAt) {
     raw,
     needsReply: true,
   }, null, 2), "application/json");
+  await touchMessageSignal(env, runtime.bot.id, externalId).catch(() => {});
   return externalId;
 }
 
@@ -309,6 +336,7 @@ async function autoReplyPendingMessages(env, runtime, options = {}) {
     return { status: "skipped", pending: 0, sent: 0 };
   }
 
+  if (options.getRuntime) runtime = await options.getRuntime();
   const latest = pending[pending.length - 1].message;
   const stopTyping = await startIlinkTyping(runtime.bot?.botToken, latest.raw);
   try {
@@ -1217,10 +1245,7 @@ export function cleanReplyText(text) {
 
 async function buildLocalReplyOutbox(text, runtime) {
   const out = [];
-  const cleaned = cleanWeixinDisplayText(text);
-  if (!cleaned) return out;
-
-  const paragraphs = splitLocalReplyText(cleaned);
+  const paragraphs = splitLocalReplyText(text);
   for (const paragraph of paragraphs) {
     const items = await buildLocalReplyItemsFromSegment(paragraph, runtime);
     out.push(...items);
@@ -1258,7 +1283,7 @@ async function buildLocalReplyItemsFromSegment(segment, runtime) {
   return out;
 }
 
-function splitLocalReplyText(text) {
+export function splitLocalReplyText(text) {
   const cleaned = cleanWeixinDisplayText(text);
   if (!cleaned) return [];
 
@@ -1666,7 +1691,7 @@ function cleanWeixinDisplayText(text) {
   return cleaned
     .split("\n")
     .map(line => line.trim())
-    .filter(line => line && !/^[)）]+$/.test(line))
+    .filter(line => !/^[)）]+$/.test(line))
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
@@ -1921,6 +1946,7 @@ async function storeOutgoingMessage(env, runtime, externalId, content, raw, repl
     // 「换一首歌」会换出同一首。存原文+位置，拼提示词/拉回小手机时按位还原。
     ...(shortcutMarker?.text ? { shortcutMarker } : {}),
   }, null, 2), "application/json");
+  await touchMessageSignal(env, runtime.bot.id, externalId).catch(() => {});
 }
 
 // 离线主动发送：借该 bot 最近一条入站消息的回复上下文（context_token）发文本。
@@ -2012,6 +2038,16 @@ async function loadRuntimePackage(env, item) {
   }
   runtimePackageCache.set(key, { runtime, updatedAt, cachedAtMs: Date.now() });
   return runtime;
+}
+
+async function touchMessageSignal(env, botId, externalId) {
+  await putObject(env, MESSAGE_SIGNAL_PATH, JSON.stringify({
+    format: "ai-phone-weixin-message-signal",
+    version: 1,
+    botId,
+    externalId,
+    updatedAt: new Date().toISOString(),
+  }), "application/json");
 }
 
 function pendingFlagPath(botId) {

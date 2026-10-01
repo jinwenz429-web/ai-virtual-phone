@@ -6,57 +6,6 @@
 const CLOUD_CRON_SECRET_PATH = "weixin-cloud/cron-secret.json";
 const CLOUD_ASSISTANT_STATE_PATH = "weixin-cloud/state/cloud-assistant.json";
 const CLOUD_CRON_JOB_NAME = "ai-phone-weixin-assistant";
-const CLOUD_CORE_CODE_PATH = "weixin-cloud/function-core.mjs";
-const REQUIRED_BUCKET_CORE_PROTOCOL_VERSION = 3;
-
-// ── 自更新加载器 ──
-// 小手机同步运行包时会把最新的 assistant-core.mjs 上传到桶里；这里每次运行
-// 优先动态加载桶里的核心逻辑，失败则回退到本文件内置的拼接版本。
-// 这样部署一次之后，后续逻辑更新随小手机同步自动生效，用户无需再到
-// Supabase 里改代码。
-// 配额注意：核心文件约 80KB，无脑重拉会烧掉用户免费档 egress（84KB × 每分钟
-// ≈ 3.5GB/月）。这里 5 分钟内直接用内存缓存；过期后带 If-None-Match 条件请求，
-// 未变更时 304 响应几乎零流量。自更新最坏晚 5 分钟生效。
-let cachedBucketCore = null;
-let cachedBucketCoreAt = 0;
-let cachedBucketCoreEtag = "";
-const BUCKET_CORE_TTL_MS = 5 * 60 * 1000;
-
-async function loadBucketCore(env) {
-  const now = Date.now();
-  if (cachedBucketCore && now - cachedBucketCoreAt < BUCKET_CORE_TTL_MS) return cachedBucketCore;
-  try {
-    const headers = { ...supabaseHeaders(env) };
-    if (cachedBucketCore && cachedBucketCoreEtag) headers["If-None-Match"] = cachedBucketCoreEtag;
-    const res = await fetch(storageObjectUrl(env, CLOUD_CORE_CODE_PATH), {
-      headers,
-      cache: "no-store",
-    });
-    if (res.status === 304 && cachedBucketCore) {
-      cachedBucketCoreAt = now;
-      return cachedBucketCore;
-    }
-    if (!res.ok) return null;
-    const code = await res.text();
-    if (!code.includes("export async function pollOnce")
-      || !code.includes(`WEIXIN_CORE_PROTOCOL_VERSION = ${REQUIRED_BUCKET_CORE_PROTOCOL_VERSION}`)) return null;
-    const bytes = new TextEncoder().encode(code);
-    let bin = "";
-    for (let i = 0; i < bytes.length; i += 0x8000) {
-      bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-    }
-    const mod = await import(`data:application/javascript;base64,${btoa(bin)}`);
-    if (typeof mod.pollOnce !== "function"
-      || typeof mod.setMediaReplyEnabled !== "function"
-      || mod.WEIXIN_CORE_PROTOCOL_VERSION !== REQUIRED_BUCKET_CORE_PROTOCOL_VERSION) return null;
-    cachedBucketCore = mod;
-    cachedBucketCoreAt = now;
-    cachedBucketCoreEtag = res.headers.get("etag") || "";
-    return mod;
-  } catch {
-    return null;
-  }
-}
 // 单次调用的时间预算：Edge Function 免费档墙钟上限 150s。只留 10s 给
 // 收尾动作（状态回写/心跳/响应），把尽量多的时间让给 LLM 与媒体生成，
 // 减少"预算不足降级模板卡"的频率；各环节的内层预留见 assistant-core。
@@ -212,9 +161,9 @@ Deno.serve(async (req) => {
     }
   }
 
-  // 优先使用桶里的最新核心逻辑，失败回退到内置版本。
-  const bucketCore = await loadBucketCore(env);
-  const core = bucketCore || { pollOnce, setMediaReplyEnabled };
+  // 固定使用部署包内置核心。Edge Function 冷启动频繁，若每次从 Storage
+  // 热加载 function-core.mjs，会按分钟消耗 Cached Egress；核心升级时重新部署函数即可。
+  const core = { pollOnce, setMediaReplyEnabled };
 
   // 离线主动发送：push-generate / push-bridge 凭部署密钥调用，把角色离线
   // 生成的消息改送微信（借该 bot 最近一条入站消息的回复上下文）。
@@ -226,12 +175,7 @@ Deno.serve(async (req) => {
       localMessageId: typeof body?.replyAfterLocalMessageId === "string" ? body.replyAfterLocalMessageId : "",
       createdAt: typeof body?.replyAfterCreatedAt === "string" ? body.replyAfterCreatedAt : "",
     };
-    const bucketSendFn = bucketCore && typeof bucketCore.sendProactiveText === "function"
-      ? bucketCore.sendProactiveText
-      : null;
-    const sendFn = bucketSendFn && (!replyAnchor.localMessageId || bucketSendFn.length >= 4)
-      ? bucketSendFn
-      : sendProactiveText;
+    const sendFn = sendProactiveText;
     try {
       const result = await sendFn(env, botId, text, replyAnchor);
       return cloudJsonResponse(200, { ok: true, ...result });
@@ -284,7 +228,7 @@ Deno.serve(async (req) => {
       skippedForDeadline,
       iterations,
       elapsedMs: Date.now() - startedAt,
-      codeSource: bucketCore ? "bucket" : "bundled",
+      codeSource: "bundled",
       bots: lastRows.map(row => ({
         botId: row.botId,
         characterId: row.characterId,

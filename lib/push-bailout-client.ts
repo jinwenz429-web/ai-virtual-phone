@@ -24,6 +24,7 @@ import {
 import { loadTimedWakeSchedules, type TimedWakeSchedule } from "./timed-wake-storage";
 import {
     IDLE_RECONNECT_MAX_CONSECUTIVE,
+    hasUnansweredUserMessage,
     loadIdleReconnectRules,
     type IdleReconnectRule,
 } from "./idle-reconnect-storage";
@@ -396,6 +397,7 @@ export async function armIdleReconnectBailout(rule: IdleReconnectRule): Promise<
         const session = loadChatSessions().find(s => s.id === rule.sessionId);
         if (!session || session.isGroup || session.contactId !== rule.characterId) return { ok: false, reason: "找不到对应的单聊会话" };
         const history = loadChatMessages(session.id);
+        const pendingUserReply = hasUnansweredUserMessage(history);
         const lastUser = [...history].reverse().find(m => m.role === "user");
         if (!lastUser) return { ok: false, reason: "这个会话还没有你的消息，无法计算沉默时间" };
         const lastUserAt = new Date(lastUser.createdAt).getTime();
@@ -421,12 +423,15 @@ export async function armIdleReconnectBailout(rule: IdleReconnectRule): Promise<
         }
 
         const elapsedMinutes = Math.max(1, Math.round((fireAt - lastUserAt) / 60000));
+        const requestAppTags = pendingUserReply ? ["chat", "text"] : ["chat", "text", "idle_wake"];
         const { llmMessages, character, config, preset, regexes, userIdentity } = await buildChatPromptMessages(
             session,
             history,
-            { appTags: ["chat", "text", "idle_wake"], timedWakeElapsedMinutes: elapsedMinutes },
+            pendingUserReply
+                ? { appTags: requestAppTags }
+                : { appTags: requestAppTags, timedWakeElapsedMinutes: elapsedMinutes },
         );
-        maybeAppendCallInvite(llmMessages, rule.characterId);
+        if (!pendingUserReply) maybeAppendCallInvite(llmMessages, rule.characterId);
         maybeAppendShortcutCapability(llmMessages, { continuationAvailable: true });
         const weixinBotId = maybeAppendWeixinChannel(llmMessages, rule.characterId);
         const request = buildProviderRequest(config, preset, toLlmRequestMessages(llmMessages));
@@ -434,7 +439,7 @@ export async function armIdleReconnectBailout(rule: IdleReconnectRule): Promise<
             const req = buildProviderRequest(config, preset, toLlmRequestMessages(messages));
             return { url: req.url, headers: req.headers, body: req.body, providerKind: req.providerKind };
         }, config.enableImageRecognition === true);
-        const remaining = IDLE_RECONNECT_MAX_CONSECUTIVE - effectiveConsecutive - 1;
+        const remaining = pendingUserReply ? 0 : IDLE_RECONNECT_MAX_CONSECUTIVE - effectiveConsecutive - 1;
         // 先挂后清：POST 本身按同键先删后插（幂等覆盖），挂稳后再清理同前缀的其他旧键
         //（旧连发序号、服务端续排的 "+" 后缀键）。之前是先清后挂，切后台/杀进程
         // 发生在清理和重挂之间会把预约整个删空——服务端从此无单可执行。
@@ -455,7 +460,7 @@ export async function armIdleReconnectBailout(rule: IdleReconnectRule): Promise<
                 characterName: character.name,
                 userName: userIdentity?.name ?? "用户",
                 appId: "chat",
-                appTags: ["chat", "text", "idle_wake"],
+                appTags: requestAppTags,
                 armAt: new Date(fireAt).toISOString(),
                 idleReconnect: { ruleId: rule.id, firedAt: fireAt },
                 ...(remaining > 0 ? { idleRepeat: { intervalMs, remaining, quietWin: buildQuietWindowMeta() } } : {}),

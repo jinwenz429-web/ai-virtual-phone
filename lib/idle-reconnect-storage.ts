@@ -10,6 +10,15 @@ registerKvMigration(IDLE_RECONNECT_RULES_KEY);
 /** 连发上限：用户不回复时最多主动发这么多次，回复后清零 */
 export const IDLE_RECONNECT_MAX_CONSECUTIVE = 3;
 
+/** 最近一条对话参与者消息来自用户时，冷场触发应当视为延迟回复。 */
+export function hasUnansweredUserMessage(messages: readonly { role?: string }[]): boolean {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        if (messages[index]?.role === "user") return true;
+        if (messages[index]?.role === "assistant") return false;
+    }
+    return false;
+}
+
 export type IdleReconnectRule = {
     id: string;
     characterId: string;

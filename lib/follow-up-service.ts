@@ -23,6 +23,7 @@ import { armFollowUpBailout, armIdleReconnectBailout, cancelBailoutKey, cancelBa
 import { isWithinPushQuietHours } from "./push-client";
 import {
     IDLE_RECONNECT_MAX_CONSECUTIVE,
+    hasUnansweredUserMessage,
     loadIdleReconnectRules,
     markIdleReconnectFired,
     resetIdleReconnectForSession,
@@ -594,6 +595,7 @@ async function fireIdleReconnect(rule: IdleReconnectRule, lastUserAt: number) {
 
         const latestMessages = loadChatMessages(session.id);
         const elapsedMinutes = Math.max(1, Math.round((Date.now() - lastUserAt) / 60000));
+        const pendingUserReply = hasUnansweredUserMessage(latestMessages);
 
         backgroundGeneratingSessions.add(session.id);
         window.dispatchEvent(new CustomEvent("followup-started", { detail: { sessionId: session.id } }));
@@ -601,10 +603,12 @@ async function fireIdleReconnect(rule: IdleReconnectRule, lastUserAt: number) {
         const rounds = await generateBackgroundCompletionRounds(
             session,
             latestMessages,
-            {
-                appTags: ["chat", "text", "idle_wake"],
-                timedWakeElapsedMinutes: elapsedMinutes,
-            },
+            pendingUserReply
+                ? { appTags: ["chat", "text"] }
+                : {
+                    appTags: ["chat", "text", "idle_wake"],
+                    timedWakeElapsedMinutes: elapsedMinutes,
+                },
         );
 
         if (isBackgroundGenerationCancelled(session.id)) {

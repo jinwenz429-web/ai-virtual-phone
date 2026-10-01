@@ -262,7 +262,7 @@ async function decryptPayload(payload: EncryptedPayload, serviceKey: string): Pr
 }
 
 // ── 主流程 ──
-type JobRow = { id: string; user_id: string; trigger_key: string; kind: string; payload: EncryptedPayload };
+type JobRow = { id: string; user_id: string; trigger_key: string; kind: string; payload: EncryptedPayload; created_at: string };
 type SubscriptionRow = { endpoint: string; p256dh: string; auth: string };
 type JobPayload = {
   request: { url: string; headers: Record<string, string>; body: Record<string, unknown>; providerKind: ProviderKind };
@@ -619,6 +619,40 @@ Deno.serve(async (req: Request) => {
     if (!rawText) {
       await finish("failed", "empty response");
       return;
+    }
+
+    // 用户可能在本轮 LLM 生成期间重新开始聊天并重挂冷场任务。
+    // running 任务本身无法中止，所以发送前再确认这一条仍属于最新冷场周期；
+    // 过期结果直接丢弃，也就不会继续派生旧的 + / ++ 任务链。
+    if (job.trigger_key.startsWith("idle:")) {
+      const baseMatch = job.trigger_key.match(/^(idle:[^:]+:)/);
+      if (baseMatch) {
+        const newer = await rest(
+          `push_jobs?user_id=eq.${encodeURIComponent(job.user_id)}`
+          + `&trigger_key=like.${encodeURIComponent(`${baseMatch[1]}%`)}`
+          + `&created_at=gt.${encodeURIComponent(job.created_at)}&select=id&limit=1`,
+        );
+        if (!newer.ok) {
+          await finish("failed", "idle cycle freshness check failed");
+          return;
+        }
+        const newerRows = await newer.json().catch(() => null) as { id?: string }[] | null;
+        const selfStillThere = await rest(
+          `push_jobs?id=eq.${encodeURIComponent(job.id)}&status=eq.running&select=id&limit=1`,
+        );
+        const selfRows = selfStillThere.ok
+          ? await selfStillThere.json().catch(() => null) as { id?: string }[] | null
+          : null;
+        if (!newerRows || !selfRows) {
+          await finish("failed", "idle cycle freshness check failed");
+          return;
+        }
+        if (selfRows.length === 0) return;
+        if (newerRows.length > 0) {
+          await finish("done", "superseded by newer idle cycle");
+          return;
+        }
+      }
     }
 
     // ── 离线来电：复用小手机既有的通话协议，并兼容已经预约的旧任务 ──

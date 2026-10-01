@@ -12,8 +12,8 @@
 // 3. 回到小手机「微信设置」点「开启云端轮询」（函数会自己创建定时任务；
 //    如失败可用「手动方式：复制定时 SQL」到 SQL Editor 执行）。
 //
-// 本函数只需部署一次：运行时会优先动态加载备份桶里由小手机同步的最新核心
-// 逻辑（weixin-cloud/function-core.mjs），失败才回退到本文件内置版本。
+// 云函数固定使用部署包内置核心，避免冷启动时反复从 Storage 拉取核心代码；
+// 后续核心逻辑有更新时，从小手机云服务部署入口重新部署一次即可。
 
 // 微信助手核心逻辑：本地助手（assistant.mjs）与云端助手（Supabase Edge Function）
 // 共用这一份代码。这里只依赖 fetch 与 node:crypto/node:buffer（Node 20+ 与 Deno 均支持），
@@ -22,14 +22,12 @@
 import { Buffer } from "node:buffer";
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
 
-// 云函数动态核心协议版本。wrapper 只加载版本一致的桶内核心，避免站点更新后
-// 继续执行旧桶里不认识微信快捷动作续跑的代码。
-export const WEIXIN_CORE_PROTOCOL_VERSION = 3;
 export const DEFAULT_BUCKET = "ai-phone-backup";
 export const DEFAULT_INTERVAL_SECONDS = 5;
 const INDEX_PATH = "weixin-cloud/index.json";
 const STATE_PREFIX = "weixin-cloud/state";
 const MESSAGE_PREFIX = "weixin-cloud/messages";
+const MESSAGE_SIGNAL_PATH = "weixin-cloud/state/message-signal.json";
 const INCOMING_MEDIA_PREFIX = "weixin-cloud/media";
 const INCOMING_IMAGE_MAX_BYTES = 6_000_000;
 const LOCK_PREFIX = "weixin-cloud/locks";
@@ -83,13 +81,34 @@ export async function pollOnce(env, targetBotId, options = {}) {
       skippedForDeadline += 1;
       continue;
     }
-    const runtime = await loadRuntimePackage(env, item);
+    let runtime = null;
+    const getRuntime = async () => {
+      if (!runtime) runtime = await loadRuntimePackage(env, item);
+      return runtime;
+    };
+
+    let pollingRuntime;
+    if (typeof item.botToken === "string" && item.botToken.trim()) {
+      pollingRuntime = {
+        bot: { id: item.botId, botToken: item.botToken },
+        character: { id: item.characterId, name: item.characterName || "" },
+        session: { id: item.sessionId },
+      };
+    } else {
+      pollingRuntime = await getRuntime();
+      const botToken = String(pollingRuntime.bot?.botToken || "").trim();
+      if (botToken) {
+        item.botToken = botToken;
+        await putObject(env, INDEX_PATH, JSON.stringify(index, null, 2), "application/json").catch(() => {});
+      }
+    }
+
     const state = await loadBotState(env, item.botId);
     const polledAt = new Date().toISOString();
 
     const data = await callIlinkJson(
       "/ilink/bot/getupdates",
-      runtime.bot?.botToken,
+      pollingRuntime.bot?.botToken,
       { get_updates_buf: state.getUpdatesBuf || "", base_info: BASE_INFO },
       "POST",
     );
@@ -112,7 +131,7 @@ export async function pollOnce(env, targetBotId, options = {}) {
     let storedMessages = 0;
     let lastStoredExternalId = "";
     for (const message of messages) {
-      const storedId = await storeIncomingMessage(env, runtime, message, polledAt);
+      const storedId = await storeIncomingMessage(env, pollingRuntime, message, polledAt);
       if (storedId) {
         storedMessages += 1;
         lastStoredExternalId = storedId;
@@ -126,12 +145,19 @@ export async function pollOnce(env, targetBotId, options = {}) {
       });
     }
 
-    const autoReply = await autoReplyPendingMessages(env, runtime, { force: options?.debug === true }).catch(async (err) => {
-      const message = errorMessage(err);
-      state.lastAutoReplyError = message;
-      await saveBotState(env, item.botId, state);
-      return { status: "failed", pending: 0, sent: 0, error: message };
-    });
+    let shouldLoadRuntime = options?.debug === true || storedMessages > 0;
+    if (!shouldLoadRuntime) {
+      const flag = await loadPendingFlag(env, item.botId).catch(() => null);
+      shouldLoadRuntime = !flag || flag.pending === true || reconcileScanDue(flag);
+    }
+    const autoReply = shouldLoadRuntime
+      ? await autoReplyPendingMessages(env, pollingRuntime, { force: options?.debug === true, getRuntime }).catch(async (err) => {
+        const message = errorMessage(err);
+        state.lastAutoReplyError = message;
+        await saveBotState(env, item.botId, state);
+        return { status: "failed", pending: 0, sent: 0, error: message };
+      })
+      : { status: "idle", pending: 0, sent: 0 };
     if (autoReply.status !== "failed") {
       state.lastAutoReplyAt = autoReply.sent > 0 ? new Date().toISOString() : state.lastAutoReplyAt;
       state.lastAutoReplyError = undefined;
@@ -209,6 +235,7 @@ async function storeIncomingMessage(env, runtime, raw, receivedAt) {
     raw,
     needsReply: true,
   }, null, 2), "application/json");
+  await touchMessageSignal(env, runtime.bot.id, externalId).catch(() => {});
   return externalId;
 }
 
@@ -326,6 +353,7 @@ async function autoReplyPendingMessages(env, runtime, options = {}) {
     return { status: "skipped", pending: 0, sent: 0 };
   }
 
+  if (options.getRuntime) runtime = await options.getRuntime();
   const latest = pending[pending.length - 1].message;
   const stopTyping = await startIlinkTyping(runtime.bot?.botToken, latest.raw);
   try {
@@ -1234,10 +1262,7 @@ export function cleanReplyText(text) {
 
 async function buildLocalReplyOutbox(text, runtime) {
   const out = [];
-  const cleaned = cleanWeixinDisplayText(text);
-  if (!cleaned) return out;
-
-  const paragraphs = splitLocalReplyText(cleaned);
+  const paragraphs = splitLocalReplyText(text);
   for (const paragraph of paragraphs) {
     const items = await buildLocalReplyItemsFromSegment(paragraph, runtime);
     out.push(...items);
@@ -1275,7 +1300,7 @@ async function buildLocalReplyItemsFromSegment(segment, runtime) {
   return out;
 }
 
-function splitLocalReplyText(text) {
+export function splitLocalReplyText(text) {
   const cleaned = cleanWeixinDisplayText(text);
   if (!cleaned) return [];
 
@@ -1683,7 +1708,7 @@ function cleanWeixinDisplayText(text) {
   return cleaned
     .split("\n")
     .map(line => line.trim())
-    .filter(line => line && !/^[)）]+$/.test(line))
+    .filter(line => !/^[)）]+$/.test(line))
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
@@ -1938,6 +1963,7 @@ async function storeOutgoingMessage(env, runtime, externalId, content, raw, repl
     // 「换一首歌」会换出同一首。存原文+位置，拼提示词/拉回小手机时按位还原。
     ...(shortcutMarker?.text ? { shortcutMarker } : {}),
   }, null, 2), "application/json");
+  await touchMessageSignal(env, runtime.bot.id, externalId).catch(() => {});
 }
 
 // 离线主动发送：借该 bot 最近一条入站消息的回复上下文（context_token）发文本。
@@ -2029,6 +2055,16 @@ async function loadRuntimePackage(env, item) {
   }
   runtimePackageCache.set(key, { runtime, updatedAt, cachedAtMs: Date.now() });
   return runtime;
+}
+
+async function touchMessageSignal(env, botId, externalId) {
+  await putObject(env, MESSAGE_SIGNAL_PATH, JSON.stringify({
+    format: "ai-phone-weixin-message-signal",
+    version: 1,
+    botId,
+    externalId,
+    updatedAt: new Date().toISOString(),
+  }), "application/json");
 }
 
 function pendingFlagPath(botId) {
@@ -2287,57 +2323,6 @@ export function errorMessage(err) {
 const CLOUD_CRON_SECRET_PATH = "weixin-cloud/cron-secret.json";
 const CLOUD_ASSISTANT_STATE_PATH = "weixin-cloud/state/cloud-assistant.json";
 const CLOUD_CRON_JOB_NAME = "ai-phone-weixin-assistant";
-const CLOUD_CORE_CODE_PATH = "weixin-cloud/function-core.mjs";
-const REQUIRED_BUCKET_CORE_PROTOCOL_VERSION = 3;
-
-// ── 自更新加载器 ──
-// 小手机同步运行包时会把最新的 assistant-core.mjs 上传到桶里；这里每次运行
-// 优先动态加载桶里的核心逻辑，失败则回退到本文件内置的拼接版本。
-// 这样部署一次之后，后续逻辑更新随小手机同步自动生效，用户无需再到
-// Supabase 里改代码。
-// 配额注意：核心文件约 80KB，无脑重拉会烧掉用户免费档 egress（84KB × 每分钟
-// ≈ 3.5GB/月）。这里 5 分钟内直接用内存缓存；过期后带 If-None-Match 条件请求，
-// 未变更时 304 响应几乎零流量。自更新最坏晚 5 分钟生效。
-let cachedBucketCore = null;
-let cachedBucketCoreAt = 0;
-let cachedBucketCoreEtag = "";
-const BUCKET_CORE_TTL_MS = 5 * 60 * 1000;
-
-async function loadBucketCore(env) {
-  const now = Date.now();
-  if (cachedBucketCore && now - cachedBucketCoreAt < BUCKET_CORE_TTL_MS) return cachedBucketCore;
-  try {
-    const headers = { ...supabaseHeaders(env) };
-    if (cachedBucketCore && cachedBucketCoreEtag) headers["If-None-Match"] = cachedBucketCoreEtag;
-    const res = await fetch(storageObjectUrl(env, CLOUD_CORE_CODE_PATH), {
-      headers,
-      cache: "no-store",
-    });
-    if (res.status === 304 && cachedBucketCore) {
-      cachedBucketCoreAt = now;
-      return cachedBucketCore;
-    }
-    if (!res.ok) return null;
-    const code = await res.text();
-    if (!code.includes("export async function pollOnce")
-      || !code.includes(`WEIXIN_CORE_PROTOCOL_VERSION = ${REQUIRED_BUCKET_CORE_PROTOCOL_VERSION}`)) return null;
-    const bytes = new TextEncoder().encode(code);
-    let bin = "";
-    for (let i = 0; i < bytes.length; i += 0x8000) {
-      bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-    }
-    const mod = await import(`data:application/javascript;base64,${btoa(bin)}`);
-    if (typeof mod.pollOnce !== "function"
-      || typeof mod.setMediaReplyEnabled !== "function"
-      || mod.WEIXIN_CORE_PROTOCOL_VERSION !== REQUIRED_BUCKET_CORE_PROTOCOL_VERSION) return null;
-    cachedBucketCore = mod;
-    cachedBucketCoreAt = now;
-    cachedBucketCoreEtag = res.headers.get("etag") || "";
-    return mod;
-  } catch {
-    return null;
-  }
-}
 // 单次调用的时间预算：Edge Function 免费档墙钟上限 150s。只留 10s 给
 // 收尾动作（状态回写/心跳/响应），把尽量多的时间让给 LLM 与媒体生成，
 // 减少"预算不足降级模板卡"的频率；各环节的内层预留见 assistant-core。
@@ -2493,9 +2478,9 @@ Deno.serve(async (req) => {
     }
   }
 
-  // 优先使用桶里的最新核心逻辑，失败回退到内置版本。
-  const bucketCore = await loadBucketCore(env);
-  const core = bucketCore || { pollOnce, setMediaReplyEnabled };
+  // 固定使用部署包内置核心。Edge Function 冷启动频繁，若每次从 Storage
+  // 热加载 function-core.mjs，会按分钟消耗 Cached Egress；核心升级时重新部署函数即可。
+  const core = { pollOnce, setMediaReplyEnabled };
 
   // 离线主动发送：push-generate / push-bridge 凭部署密钥调用，把角色离线
   // 生成的消息改送微信（借该 bot 最近一条入站消息的回复上下文）。
@@ -2507,12 +2492,7 @@ Deno.serve(async (req) => {
       localMessageId: typeof body?.replyAfterLocalMessageId === "string" ? body.replyAfterLocalMessageId : "",
       createdAt: typeof body?.replyAfterCreatedAt === "string" ? body.replyAfterCreatedAt : "",
     };
-    const bucketSendFn = bucketCore && typeof bucketCore.sendProactiveText === "function"
-      ? bucketCore.sendProactiveText
-      : null;
-    const sendFn = bucketSendFn && (!replyAnchor.localMessageId || bucketSendFn.length >= 4)
-      ? bucketSendFn
-      : sendProactiveText;
+    const sendFn = sendProactiveText;
     try {
       const result = await sendFn(env, botId, text, replyAnchor);
       return cloudJsonResponse(200, { ok: true, ...result });
@@ -2565,7 +2545,7 @@ Deno.serve(async (req) => {
       skippedForDeadline,
       iterations,
       elapsedMs: Date.now() - startedAt,
-      codeSource: bucketCore ? "bucket" : "bundled",
+      codeSource: "bundled",
       bots: lastRows.map(row => ({
         botId: row.botId,
         characterId: row.characterId,
