@@ -18,7 +18,6 @@ import android.webkit.JavascriptInterface
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
-import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
@@ -36,7 +35,7 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         val SITE_URL: String = BuildConfig.SITE_URL
-        const val VERSION = "1.0.2"
+        const val VERSION = "1.0.3"
         /** 来电接听等场景的站内深链（必须以 SITE_URL 开头，否则忽略） */
         const val EXTRA_OPEN_URL = "open_url"
     }
@@ -101,21 +100,8 @@ class MainActivity : AppCompatActivity() {
             databaseEnabled = true
             mediaPlaybackRequiresUserGesture = false
             allowFileAccess = false
-
-            // 显式固定现代移动页的 viewport 行为，避免旧版/厂商 WebView
-            // 使用实现默认值后出现宽度重排、整体缩放或裁切。
-            useWideViewPort = true
-            loadWithOverviewMode = true
-            layoutAlgorithm = WebSettings.LayoutAlgorithm.NORMAL
-            textZoom = 100
-            setSupportZoom(false)
-            builtInZoomControls = false
-            displayZoomControls = false
-
             userAgentString = "$userAgentString FloatShell/$VERSION"
         }
-        // 0 lets WebView derive the scale from the page's viewport meta tag and density.
-        webView.setInitialScale(0)
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, false)
 
@@ -137,9 +123,17 @@ class MainActivity : AppCompatActivity() {
                 }.getOrDefault(true)
             }
 
+            override fun onPageCommitVisible(view: WebView, url: String) {
+                super.onPageCommitVisible(view, url)
+                if (Uri.parse(url).host == Uri.parse(SITE_URL).host) {
+                    forceShellMobileLayout(view)
+                }
+            }
+
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
                 if (Uri.parse(url).host == Uri.parse(SITE_URL).host) {
+                    forceShellMobileLayout(view)
                     cleanLegacyPwaState(view)
                 }
             }
@@ -237,6 +231,121 @@ class MainActivity : AppCompatActivity() {
         val target = intent?.getStringExtra(EXTRA_OPEN_URL) ?: return null
         intent.removeExtra(EXTRA_OPEN_URL)
         return target.takeIf { it.startsWith(SITE_URL) }
+    }
+
+    /**
+     * Huawei WebView 114 不可靠地报告 hover/pointer media features，导致网页的
+     * @media (hover: none) and (pointer: coarse) 移动布局完全不命中。壳环境本身
+     * 已经确定是手机，因此直接补上与网页移动端分支等价的壳布局，不再猜 media query。
+     */
+    private fun forceShellMobileLayout(view: WebView) {
+        view.evaluateJavascript(
+            """(function() {
+                try {
+                    var root = document.documentElement;
+                    root.setAttribute('data-float-shell-mobile', '1');
+                    if (document.getElementById('float-shell-mobile-layout')) return;
+
+                    var style = document.createElement('style');
+                    style.id = 'float-shell-mobile-layout';
+                    style.textContent = `
+html[data-float-shell-mobile="1"] {
+  --phone-screen-width: 100vw;
+  --phone-screen-height: 100lvh;
+  overflow: hidden !important;
+  width: 100% !important;
+  height: 100lvh !important;
+  background: var(--c-page-body-bg);
+}
+html[data-float-shell-mobile="1"] body {
+  overflow: hidden !important;
+  width: 100% !important;
+  height: 100lvh !important;
+  margin: 0 !important;
+  background: var(--c-page-body-bg);
+}
+html[data-float-shell-mobile="1"] .app-root {
+  width: 100vw !important;
+  height: 100lvh !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  display: flex !important;
+  justify-content: flex-start !important;
+  align-items: flex-start !important;
+  overflow: hidden !important;
+  background: var(--c-page-body-bg);
+}
+html[data-float-shell-mobile="1"] .phone-shell-wrap {
+  --phone-case-padding: 0px;
+  --phone-case-border-size: 0px;
+  --phone-frame-size: 0px;
+  --phone-screen-radius: 0px;
+  --phone-frame-radius: 0px;
+  --phone-case-radius: 0px;
+  width: 100vw !important;
+  margin-inline: 0 !important;
+  margin-top: calc(-1 * var(--status-bar-drop, 0px)) !important;
+  gap: 0 !important;
+  transform-origin: top left;
+  transform: translate3d(0, calc(-1 * var(--mobile-keyboard-lift, 0px)), 0);
+}
+html[data-float-shell-mobile="1"] .phone-shell-wrap .phone-case,
+html[data-float-shell-mobile="1"] .phone-shell-wrap .phone-frame {
+  width: 100vw !important;
+  padding: 0 !important;
+  border: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+html[data-float-shell-mobile="1"] .phone-shell-wrap .phone-case::before,
+html[data-float-shell-mobile="1"] .phone-shell-wrap .phone-case::after,
+html[data-float-shell-mobile="1"] .phone-shell-wrap .phone-frame::before,
+html[data-float-shell-mobile="1"] .phone-shell-wrap .phone-frame::after {
+  display: none !important;
+}
+html[data-float-shell-mobile="1"] .phone-shell {
+  width: 100vw !important;
+  height: 100lvh !important;
+  border-radius: 0 !important;
+}
+html[data-float-shell-mobile="1"] .app-root.splash-root {
+  width: 100vw !important;
+  height: 100lvh !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  display: flex !important;
+  align-items: flex-start !important;
+  justify-content: flex-start !important;
+  overflow: hidden !important;
+}
+html[data-float-shell-mobile="1"] .splash-shell-wrap,
+html[data-float-shell-mobile="1"] .splash-shell-wrap .phone-case,
+html[data-float-shell-mobile="1"] .splash-shell-wrap .phone-frame {
+  width: 100vw !important;
+}
+@media (max-width: 373px) {
+  html[data-float-shell-mobile="1"] .icon-grid,
+  html[data-float-shell-mobile="1"] .dock {
+    --slot-size: 16.92vw;
+    --slot-gap-x: 5.13vw;
+    --slot-icon-width: 15.9vw;
+    --slot-icon-height: 15.9vw;
+  }
+  html[data-float-shell-mobile="1"] .icon-glyph-box,
+  html[data-float-shell-mobile="1"] .dock .dock-glyph-box {
+    width: 14.87vw;
+    height: 14.87vw;
+  }
+  html[data-float-shell-mobile="1"] .dock {
+    width: min(calc((var(--dock-count) * var(--slot-size)) + ((var(--dock-count) - 1) * var(--slot-gap-x)) + 30px), calc(100% - 8px));
+  }
+}
+`;
+                    (document.head || document.documentElement).appendChild(style);
+                } catch (_) {}
+            })()""".trimIndent(),
+            null,
+        )
     }
 
     /**
