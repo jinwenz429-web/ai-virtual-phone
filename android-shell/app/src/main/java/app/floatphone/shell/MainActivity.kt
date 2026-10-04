@@ -35,7 +35,7 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         val SITE_URL: String = BuildConfig.SITE_URL
-        const val VERSION = "1.0.3"
+        const val VERSION = "1.0.4"
         /** 来电接听等场景的站内深链（必须以 SITE_URL 开头，否则忽略） */
         const val EXTRA_OPEN_URL = "open_url"
     }
@@ -286,8 +286,12 @@ html[data-float-shell-mobile="1"] .phone-shell-wrap {
   margin-inline: 0 !important;
   margin-top: calc(-1 * var(--status-bar-drop, 0px)) !important;
   gap: 0 !important;
-  transform-origin: top left;
-  transform: translate3d(0, calc(-1 * var(--mobile-keyboard-lift, 0px)), 0);
+  position: relative !important;
+  top: calc(-1 * var(--mobile-keyboard-lift, 0px));
+  transform: none !important;
+  -webkit-transform: none !important;
+  will-change: auto !important;
+  transition: top 0.18s cubic-bezier(0.22, 1, 0.36, 1);
 }
 html[data-float-shell-mobile="1"] .phone-shell-wrap .phone-case,
 html[data-float-shell-mobile="1"] .phone-shell-wrap .phone-frame {
@@ -323,6 +327,35 @@ html[data-float-shell-mobile="1"] .splash-shell-wrap .phone-case,
 html[data-float-shell-mobile="1"] .splash-shell-wrap .phone-frame {
   width: 100vw !important;
 }
+
+/* Huawei WebView 114 在 fixed 弹窗 + transformed ancestor/动画合成层下会出现
+   局部不重绘。APK 壳不需要这层动画，优先保证整块弹窗稳定绘制。 */
+html[data-float-shell-mobile="1"] .modal-overlay,
+html[data-float-shell-mobile="1"] [data-ui="modal"] {
+  position: fixed !important;
+  inset: 0 !important;
+  width: auto !important;
+  height: auto !important;
+  transform: none !important;
+  -webkit-transform: none !important;
+  will-change: auto !important;
+  animation: none !important;
+}
+html[data-float-shell-mobile="1"] .modal-dialog,
+html[data-float-shell-mobile="1"] .modal-sheet,
+html[data-float-shell-mobile="1"] .modal-expand,
+html[data-float-shell-mobile="1"] [data-ui="modal-dialog"] {
+  box-sizing: border-box !important;
+  transform: none !important;
+  -webkit-transform: none !important;
+  will-change: auto !important;
+  animation: none !important;
+}
+html[data-float-shell-mobile="1"] [aria-modal="true"] {
+  will-change: auto !important;
+  animation: none !important;
+}
+
 @media (max-width: 373px) {
   html[data-float-shell-mobile="1"] .icon-grid,
   html[data-float-shell-mobile="1"] .dock {
