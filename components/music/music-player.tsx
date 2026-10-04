@@ -447,7 +447,7 @@ export default function MusicPlayer() {
 
             {/* Header */}
             <div className="mp-top">
-                <button className="music-player-close" onClick={player.closeFullPlayer}>
+                <button data-float-back aria-label="返回" className="music-player-close" onClick={player.closeFullPlayer}>
                     <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
                         <path d="M15 19 8 12l7-7" />
                     </svg>

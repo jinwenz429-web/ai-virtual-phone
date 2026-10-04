@@ -300,7 +300,7 @@ export default function MusicApp({ onClose }: Props) {
                         if (dailyView) { setDailyView(null); }
                         else if (activePlaylist) { setActivePlaylist(null); }
                         else { onClose(); }
-                    }} title="返回">
+                    }} title="返回" aria-label="返回">
                         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round">
                             <polyline points="15 18 9 12 15 6" />
                         </svg>
@@ -1659,7 +1659,7 @@ function MusicSettingsTab({ onBack, onSaved }: { onBack: () => void; onSaved: ()
         <div className="music-settings">
             <div className="music-settings-header">
                 <h2>设置</h2>
-                <button className="music-settings-close" onClick={onBack}>
+                <button className="music-settings-close" onClick={onBack} aria-label="返回">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
                 </button>
             </div>

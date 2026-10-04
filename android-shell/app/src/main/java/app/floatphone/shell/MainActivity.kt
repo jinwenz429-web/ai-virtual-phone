@@ -35,13 +35,14 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         val SITE_URL: String = BuildConfig.SITE_URL
-        const val VERSION = "1.0.0"
+        const val VERSION = "1.0.1"
         /** 来电接听等场景的站内深链（必须以 SITE_URL 开头，否则忽略） */
         const val EXTRA_OPEN_URL = "open_url"
     }
 
     private lateinit var webView: WebView
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
+    private var backRequestPending = false
 
     private val fileChooserLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -175,7 +176,25 @@ class MainActivity : AppCompatActivity() {
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (webView.canGoBack()) webView.goBack() else moveTaskToBack(true)
+                if (backRequestPending) return
+                backRequestPending = true
+                // SPA 内部页面不在 WebView 历史里，先交给网页当前最上层的返回按钮。
+                webView.evaluateJavascript(
+                    """(function() {
+                        if (typeof window.floatHandleBack !== 'function') return null;
+                        return window.floatHandleBack();
+                    })()""".trimIndent()
+                ) { result ->
+                    backRequestPending = false
+                    if (isFinishing || isDestroyed) return@evaluateJavascript
+                    when (result) {
+                        "true" -> Unit // 网页只关闭/返回了一层，不再额外 goBack。
+                        "false" -> moveTaskToBack(true) // 已在 float 桌面。
+                        else -> { // 兼容尚未部署网页返回桥的旧版本。
+                            if (webView.canGoBack()) webView.goBack() else moveTaskToBack(true)
+                        }
+                    }
+                }
             }
         })
 

@@ -177,7 +177,7 @@ export function DesktopCustomizer({ draft, onDraftChange, onApply, onClose }: De
         <span className="ts-16 font-medium text-[var(--c-text-title)] flex items-center gap-2">
           <Palette size={18} /> 个性化装扮
         </span>
-        <button onClick={onClose} className="p-1.5 bg-gray-100 rounded-full text-gray-500 hover:bg-gray-200 transition-colors">
+        <button data-float-back aria-label="关闭个性化装扮" onClick={onClose} className="p-1.5 bg-gray-100 rounded-full text-gray-500 hover:bg-gray-200 transition-colors">
           <X size={18} />
         </button>
       </div>

@@ -3,6 +3,7 @@
 import { Component, memo, useCallback, useEffect, useInsertionEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ErrorInfo, type ReactNode } from "react";
 
 import { updateStatusBarTone } from "@/lib/bg-tone";
+import { handleAndroidBack } from "@/lib/android-back-navigation";
 import { startDiaryEntryTimerService, stopDiaryEntryTimerService } from "@/lib/diary-entry-timer-service";
 import { startFollowUpService, stopFollowUpService } from "@/lib/follow-up-service";
 import { startMomentsService, stopMomentsService } from "@/lib/moments-engine";
@@ -4126,6 +4127,38 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
       : null;
   }
 
+  useEffect(() => {
+    const shellWindow = window as Window & { floatHandleBack?: () => boolean };
+    const handleBack = () => {
+      if (handleAndroidBack(document)) return true;
+      if (activeApp) {
+        const customApp = getCustomAppForIcon(activeApp);
+        if (customApp) closeCustomAppRunner(customApp);
+        else if (activeApp === "xiaohongshu") handleCloseXiaohongshu();
+        else if (activeApp === "shopping") handleCloseShopping();
+        else {
+          setActiveApp(null);
+          setActiveChatSession(null);
+          setChatInitSessionId(null);
+        }
+        return true;
+      }
+      if (openFolderId) {
+        setOpenFolderId(null);
+        return true;
+      }
+      if (editMode) {
+        exitEditMode();
+        return true;
+      }
+      return false;
+    };
+    shellWindow.floatHandleBack = handleBack;
+    return () => {
+      if (shellWindow.floatHandleBack === handleBack) delete shellWindow.floatHandleBack;
+    };
+  }, [activeApp, customApps, customAppLaunchContext, openFolderId, editMode, handleCloseXiaohongshu, handleCloseShopping]);
+
   return (
     <>
       <section
@@ -4822,7 +4855,7 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
                     <span className="ts-16 font-medium text-[var(--c-text-title)] flex items-center gap-2">
                       <LayoutGrid size={18} /> 添加组件
                     </span>
-                    <button className="ui-bare-btn text-[var(--c-icon)]" onClick={() => setShowWidgetPicker(false)}>✕</button>
+                    <button data-float-back aria-label="关闭添加组件" className="ui-bare-btn text-[var(--c-icon)]" onClick={() => setShowWidgetPicker(false)}>✕</button>
                   </div>
 
                   <div className="px-4 py-3 flex gap-2 w-full">

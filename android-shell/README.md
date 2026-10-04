@@ -21,7 +21,9 @@
 
 仓库已带工作流 `.github/workflows/android-shell.yml`：
 
-1. 在仓库 **Settings → Secrets and variables → Actions → Variables** 新建
+这个 fork 默认加载 `https://float592.netlify.app/`。需要换站点时，设置下述仓库变量或手动构建输入即可覆盖。
+
+1. 可选：在仓库 **Settings → Secrets and variables → Actions → Variables** 新建
    `SHELL_SITE_URL`，值为你的 HTTPS 站点地址。手动运行工作流时也可以临时填写
    `site_url`，它会覆盖仓库变量。
 2. GitHub 仓库页 → **Actions** → **Build Android Shell APK** → **Run workflow**。
@@ -67,6 +69,22 @@ base64 -w0 shell.keystore   # 得到一长串 base64
    **不要关「角色消息」渠道**。
 
 设置 → 离线推送里点「测试」：杀掉后台，约 6 秒后应收到系统通知即为连通。
+
+## 系统返回键 / 侧滑返回
+
+壳会先调用网页的 `window.floatHandleBack()`，复用当前可见页面的返回或取消操作。
+每次只处理一层：例如弹窗 → 聊天设置 → 聊天室 → 消息列表 → float 桌面。
+现实桥编辑向导会先退回上一操作步骤；隐藏的缓存页面不会参与返回。
+只有网页已在桌面且没有弹窗、文件夹或编辑模式时，系统返回才把应用放到后台。
+旧版网页没有返回桥时，壳仍兼容原来的 WebView 历史返回。
+
+返回逻辑完全在本机执行，不访问 Supabase。自定义页面可给已有返回控件添加
+`data-float-back`，或使用以「返回」开头的 `aria-label` 接入同一逻辑。
+
+网页返回回归测试使用 Chromium：先运行 `npx playwright install chromium`，再运行
+`node --import ./tests/register-typescript-loader.mjs --test tests/*.test.mjs`。
+已有 Chromium 时可设置 `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` 指向其可执行文件。
+测试覆盖单层返回、弹窗取消、向导上一步和隐藏缓存页面；安卓侧滑仍需在手机上验收。
 
 ## 数据存放与迁移
 
