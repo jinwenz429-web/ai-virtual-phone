@@ -1,3 +1,4 @@
+import { supabaseAuthHeaders } from "../supabase-auth";
 type SupabaseConfig = {
   url: string;
   key: string;
@@ -37,8 +38,7 @@ export async function supabaseRestFetch<T>(
   const response = await fetch(`${config.url}/rest/v1/${path}`, {
     ...init,
     headers: {
-      apikey: config.key,
-      Authorization: `Bearer ${config.key}`,
+      ...supabaseAuthHeaders(config.key),
       "Content-Type": "application/json",
       ...(init?.headers ?? {}),
     },

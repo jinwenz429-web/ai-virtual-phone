@@ -1,3 +1,4 @@
+import { supabaseAuthHeaders } from "./supabase-auth";
 // 现实桥离线联动·客户端同步器：
 // 把规则/云配置/触发状态 + 每条「让TA回话」规则的 prompt 快照（带占位哨兵）
 // 同步到服务端。快照用前台同一条组装链路构建，服务端只做占位符替换。
@@ -356,15 +357,14 @@ async function buildScreenChatSnapshot(): Promise<Record<string, unknown> | null
 const BRIDGE_CAP_LIFTED_KV = "bridge_daily_cap_lifted_v1";
 
 async function liftPersonalBridgeDailyCap(cloudConfig: { url: string; key: string }): Promise<void> {
-    if (kvGet(BRIDGE_CAP_LIFTED_KV) === "done") return;
+    if (kvGet(BRIDGE_CAP_LIFTED_KV) === "done" || cloudConfig.key.startsWith("sb_")) return;
     try {
         const base = cloudConfig.url.replace(/\/+$/, "");
         // 个人云的 push_bridge_config 只有拥有者一行，not.is.null 过滤只为满足语义
         const response = await fetch(`${base}/rest/v1/push_bridge_config?user_id=not.is.null`, {
             method: "PATCH",
             headers: {
-                apikey: cloudConfig.key,
-                Authorization: `Bearer ${cloudConfig.key}`,
+                ...supabaseAuthHeaders(cloudConfig.key),
                 "Content-Type": "application/json",
                 Prefer: "return=minimal",
             },

@@ -143,7 +143,7 @@ async function runChatAction(
   } catch (err) {
     console.warn("[现实桥] 角色回应生成失败", err);
   }
-  return "写入聊天（回应失败）";
+  throw new Error("写入聊天后回应失败，请检查模型配置或网络后重试");
 }
 
 async function runActions(rule: BridgeRule, item: BridgeItem, text: string): Promise<string[]> {
@@ -380,10 +380,10 @@ export async function processBridgeItem(item: BridgeItem): Promise<BridgeFeedEnt
       continue;
     }
     try {
-      markBridgeRuleRun(rule.id);
       const text = await processText(rule, item);
       if (text !== item.payload) entry.processed = text.slice(0, 2000);
       entry.actions.push(...await runActions(rule, item, text));
+      markBridgeRuleRun(rule.id);
     } catch (err) {
       entry.error = err instanceof Error ? err.message : String(err);
       console.warn("[现实桥] 规则执行失败", rule.name, err);

@@ -46,7 +46,7 @@ const SHORTCUT_COMMAND_SELECT = [
 ].join(",");
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "content-type, x-ai-phone-service-key, x-ai-phone-origin",
+  "Access-Control-Allow-Headers": "content-type, x-ai-phone-service-key, x-ai-phone-origin, x-upsert, prefer",
   "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
 };
 const VERIFIED_KEY_TTL_MS = 5 * 60 * 1000;
@@ -116,7 +116,7 @@ async function hasProjectAdminAccess(supabaseUrl: string, candidate: string): Pr
   if (cachedUntil > Date.now()) return true;
 
   const response = await fetch(`${supabaseUrl}/auth/v1/admin/users?page=1&per_page=1`, {
-    headers: { apikey: candidate, Authorization: `Bearer ${candidate}` },
+    headers: { apikey: candidate, ...(!candidate.startsWith("sb_") ? { Authorization: `Bearer ${candidate}` } : {}) },
   }).catch(() => null);
   const allowed = response?.ok === true;
   await response?.body?.cancel().catch(() => undefined);
@@ -473,13 +473,18 @@ Deno.serve(async (request: Request) => {
       if (!userId) return json({ ok: false, error: "令牌无效。" }, 403);
       const config = await loadConfig();
       if (!config.payload_key) throw new Error("推送配置未初始化。");
-      // 同名扫描任务幂等覆盖：连续唤醒只保留一次扫描（扫描会拉走全部）。
-      // 预删除不限状态——唯一索引覆盖全状态，残留 done/failed 行会撞约束。
+      // Preserve active scans and their encrypted checkpoints across repeated wakes.
       const triggerKey = `bridge:scan:${userId}`;
-      await readJson(await rest(
-        `push_jobs?user_id=eq.${encodeURIComponent(userId)}&trigger_key=eq.${encodeURIComponent(triggerKey)}`,
-        { method: "DELETE", headers: { Prefer: "return=representation" } },
-      )).catch(() => undefined);
+      const filter = `push_jobs?user_id=eq.${encodeURIComponent(userId)}&trigger_key=eq.${encodeURIComponent(triggerKey)}`;
+      const existing = await readJson<{ id: string; status: string }[]>(await rest(`${filter}&select=id,status&limit=1`));
+      if (existing[0]?.status === "pending" || existing[0]?.status === "running") return json({ ok: true, note: "scan already scheduled" });
+      if (existing[0]?.status === "failed") {
+        await readJson(await rest(`${filter}&status=eq.failed`, {
+          method: "PATCH", body: JSON.stringify({ status: "pending", execute_at: new Date(Date.now() + 45_000).toISOString(), updated_at: new Date().toISOString() }),
+        }));
+        return json({ ok: true, note: "scan retry scheduled" });
+      }
+      await readJson(await rest(`${filter}&status=in.(done,cancelled)`, { method: "DELETE" }));
       const insert = await rest("push_jobs", {
         method: "POST",
         body: JSON.stringify([{
@@ -507,6 +512,32 @@ Deno.serve(async (request: Request) => {
   const suppliedKey = request.headers.get("x-ai-phone-service-key") || "";
   if (suppliedKey !== serviceKey && !await hasProjectAdminAccess(supabaseUrl, suppliedKey)) {
     return json({ ok: false, error: "个人云 service_role 密钥无效，或不属于当前 Supabase 项目。" }, 401);
+  }
+
+  // New secret keys are browser-blocked by Supabase Storage. Forward a bounded
+  // backup request after same-project admin authorization; never accept a target host.
+  if (action === "storage") {
+    try {
+      const path = url.searchParams.get("path") || "";
+      const decoded = decodeURIComponent(path.split("?")[0]);
+      const allowed = decoded === "/storage/v1/bucket"
+        || decoded === "/storage/v1/object/list/ai-phone-backup"
+        || decoded.startsWith("/storage/v1/object/ai-phone-backup/");
+      if (!allowed || /[\\]/.test(decoded) || decoded.split("/").some(part => part === "." || part === "..")
+        || !["GET", "POST", "DELETE"].includes(request.method)) return json({ ok: false, error: "存储路径或方法无效。" }, 400);
+      const target = new URL(path, supabaseUrl);
+      if (target.origin !== new URL(supabaseUrl).origin) return json({ ok: false, error: "存储地址无效。" }, 400);
+      const upstream = await fetch(target, {
+        method: request.method,
+        headers: { apikey: suppliedKey, ...(!suppliedKey.startsWith("sb_") ? { Authorization: `Bearer ${suppliedKey}` } : {}),
+          "Content-Type": request.headers.get("Content-Type") || "application/octet-stream",
+          "x-upsert": request.headers.get("x-upsert") || "false" },
+        ...(request.method === "POST" ? { body: await request.arrayBuffer() } : {}),
+        redirect: "error",
+      });
+      return new Response(upstream.body, { status: upstream.status, headers: { ...CORS_HEADERS,
+        "Content-Type": upstream.headers.get("Content-Type") || "application/octet-stream", "Cache-Control": "no-store" } });
+    } catch { return json({ ok: false, error: "个人云存储请求失败。" }, 502); }
   }
 
   // 向本项目 owner 的全部订阅推送「运行快捷指令」通知，点开即 run 入口。

@@ -2,6 +2,7 @@
 
 import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 
+import { copyTextToClipboard } from "@/lib/clipboard";
 import { loadCharacters } from "@/lib/character-storage";
 import { CLOUD_BACKUP_BUCKET, normalizeBackupUrl } from "@/lib/cloud-backup/config";
 import { pollRealityBridgeNow, REALITY_BRIDGE_FEED_UPDATED_EVENT } from "@/components/reality-bridge-scheduler";
@@ -241,6 +242,7 @@ export function RealityBridgeApp({ onClose, onNotice }: {
   const [shortcutEmailCode, setShortcutEmailCode] = useState("");
   const [shortcutEmailBusy, setShortcutEmailBusy] = useState<"send" | "verify" | "remove" | null>(null);
   const [copiedText, setCopiedText] = useState("");
+  const [manualCopyText, setManualCopyText] = useState("");
   const [syncing, setSyncing] = useState(false);
   const [bridgeToken, setBridgeToken] = useState("");
   const [closing, setClosing] = useState(false);
@@ -761,16 +763,19 @@ export function RealityBridgeApp({ onClose, onNotice }: {
     return seen;
   }, [feed]);
 
-  const copy = useCallback((text: string, label: string) => {
-    const done = () => {
-      setCopiedText(text);
-      window.setTimeout(() => setCopiedText(current => current === text ? "" : current), 1600);
-      onNotice?.(label + "已复制");
-    };
-    if (navigator.clipboard?.writeText) {
-      navigator.clipboard.writeText(text).then(done).catch(() => done());
-    } else done();
+  const copy = useCallback(async (text: string, label: string) => {
+    if (!await copyTextToClipboard(text)) {
+      setManualCopyText(text);
+      onNotice?.("复制失败，请在弹出的文本框中手动复制");
+      return;
+    }
+    setCopiedText(text);
+    window.setTimeout(() => setCopiedText(current => current === text ? "" : current), 1600);
+    onNotice?.(label + "已复制");
   }, [onNotice]);
+  const uploadAuthName = config.key?.startsWith("sb_") ? "apikey" : "Authorization";
+  const uploadAuthValue = config.key ? (uploadAuthName === "apikey" ? config.key : `Bearer ${config.key}`) : "";
+  const uploadAuthPreview = config.key ? `${uploadAuthName === "Authorization" ? "Bearer " : ""}${config.key.slice(0, 12)}……${config.key.slice(-6)}` : "<请先完成第一步>";
 
   const isExistingRule = editing !== null && rules.some(rule => rule.id === editing.id);
 
@@ -796,9 +801,9 @@ export function RealityBridgeApp({ onClose, onNotice }: {
         <i>3</i>
         <div className="rb-substep-body">
           <p><b>配置请求</b>：展开地址下方的选项，方法选 <b>POST</b>，请求体选 <b>JSON</b>。</p>
-          <p>「头部」新增一项：名称填 <button type="button" className="rb-copychip" onClick={() => copy("Authorization", "头部名称")}>Authorization</button>，值填下方密钥：</p>
-          <div className="rb-code" onClick={() => copy(`Bearer ${config.key || ""}`, "密钥")}>
-            <code>{config.key ? `Bearer ${config.key.slice(0, 12)}……${config.key.slice(-6)}` : "<请先完成第一步>"}</code>
+          <p>「头部」新增一项：名称填 <button type="button" className="rb-copychip" onClick={() => copy(uploadAuthName, "头部名称")}>{uploadAuthName}</button>，值填下方密钥：</p>
+          <div className="rb-code" onClick={() => copy(uploadAuthValue, "密钥")}>
+            <code>{uploadAuthPreview}</code>
             <span className="rb-copy">复制</span>
           </div>
           <p>再到「请求体」里新增两个「<b>文本</b>」类型字段：<b>type</b> 填信号名（例：duanxin）；<b>payload</b> 填要回传给小手机的正文（可插入「短信正文」等变量）。</p>
@@ -1925,9 +1930,9 @@ export function RealityBridgeApp({ onClose, onNotice }: {
                   <div className="rb-substep">
                     <i>3</i>
                     <div className="rb-substep-body">
-                      <p><b>设置头部</b>（两项都要）：<button type="button" className="rb-copychip" onClick={() => copy("Authorization", "头部名称")}>Authorization</button> 填下方密钥；<button type="button" className="rb-copychip" onClick={() => copy("x-upsert", "头部名称")}>x-upsert</button> 填 <button type="button" className="rb-copychip" onClick={() => copy("true", "头部值")}>true</button>（快照反复覆盖同一地址，缺它第二次上传会报 409）。</p>
-                      <div className="rb-code" onClick={() => copy(`Bearer ${config.key || ""}`, "密钥")}>
-                        <code>{config.key ? `Bearer ${config.key.slice(0, 12)}……${config.key.slice(-6)}` : "<请先完成第一步>"}</code>
+                      <p><b>设置头部</b>（两项都要）：<button type="button" className="rb-copychip" onClick={() => copy(uploadAuthName, "头部名称")}>{uploadAuthName}</button> 填下方密钥；<button type="button" className="rb-copychip" onClick={() => copy("x-upsert", "头部名称")}>x-upsert</button> 填 <button type="button" className="rb-copychip" onClick={() => copy("true", "头部值")}>true</button>（快照反复覆盖同一地址，缺它第二次上传会报 409）。</p>
+                      <div className="rb-code" onClick={() => copy(uploadAuthValue, "密钥")}>
+                        <code>{uploadAuthPreview}</code>
                         <span className="rb-copy">复制</span>
                       </div>
                     </div>
@@ -2151,6 +2156,18 @@ export function RealityBridgeApp({ onClose, onNotice }: {
                   aria-label={screenWizStep === 4 ? "保存屏幕速聊" : "下一步"}
                 >{screenWizStep === 4 ? RB_ICON_CHECK : RB_ICON_ARROW}</button>
               </div>
+            </div>
+          </div>
+        ) : null}
+
+        {manualCopyText ? (
+          <div className="rb-modal-mask" style={{ zIndex: 40 }} onClick={() => setManualCopyText("")}>
+            <div className="rb-modal rb-editor" role="dialog" aria-modal="true" aria-label="手动复制" onClick={event => event.stopPropagation()}>
+              <b className="rb-modal-title">手动复制</b>
+              <p className="rb-hint">长按下方完整文字，选择「复制」。</p>
+              <textarea aria-label="待复制内容" readOnly value={manualCopyText} rows={5} autoFocus
+                onFocus={event => event.currentTarget.select()} style={{ width: "100%", userSelect: "text" }} />
+              <button type="button" className="rb-btn" onClick={() => setManualCopyText("")}>关闭</button>
             </div>
           </div>
         ) : null}

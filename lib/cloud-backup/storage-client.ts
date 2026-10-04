@@ -1,3 +1,4 @@
+import { personalStorageRequest, supabaseAuthHeaders } from "../supabase-auth";
 import { CLOUD_BACKUP_BUCKET, normalizeBackupUrl, type CloudBackupConfig } from "./config";
 
 /**
@@ -16,7 +17,7 @@ function resolveCreds(config: CloudBackupConfig): Creds | null {
 }
 
 function authHeaders(key: string): Record<string, string> {
-  return { apikey: key, Authorization: `Bearer ${key}` };
+  return supabaseAuthHeaders(key);
 }
 
 function objectUrl(creds: Creds, path: string): string {
@@ -56,7 +57,8 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
+    const request = personalStorageRequest(url, { ...init, signal: controller.signal });
+    return await fetch(request.url, request.init);
   } catch (error) {
     if (controller.signal.aborted) throw new Error(`${what}超时（${Math.round(timeoutMs / 1000)} 秒无响应），请检查网络后重试。`);
     throw error;

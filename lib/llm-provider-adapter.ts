@@ -267,7 +267,7 @@ function normalizeVisionImageUrl(value: string): string | null {
 
 function normalizeVisionParts(messages: LlmRequestMessage[]): LlmRequestMessage[] {
     return messages.map((message) => {
-        if (!Array.isArray(message.content)) return message;
+        if ((message.role !== "user" && message.role !== "system") || !Array.isArray(message.content)) return message;
         const content = message.content.map((part): LLMContentPart => {
             if (part.type === "text") return part;
             const url = normalizeVisionImageUrl(part.image_url.url);

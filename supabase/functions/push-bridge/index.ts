@@ -1,10 +1,14 @@
 // 现实桥服务端联动执行器（Supabase Edge Function 版）
 // 部署：Dashboard → Edge Functions → 新建函数 push-bridge → 粘贴本文件 →
 //      关闭 JWT 校验（本函数用 cron_secret 自校验）
-// 职责：扫描用户自有 Supabase 的桥收件箱（拉走即删，与客户端互斥）→
+// 职责：扫描用户自有 Supabase 的桥收件箱（移动到任务专属暂存区，与客户端互斥）→
 //      匹配规则 → 冷却/上限 → 模板/AI 加工 → 占位符替换进 prompt 快照 →
 //      生成真回复 → 写 push_outbox → 逐条推送。逻辑与 netlify 版一致。
 // 注意：自包含移植文件，改动共享逻辑时需同步。
+
+async function bridgeOutboxId(ruleId: string, itemId: string): Promise<string> {
+  return `bridge_${bytesToB64url(new Uint8Array(await crypto.subtle.digest("SHA-256", utf8(JSON.stringify([ruleId, itemId])))))}`;
+}
 
 type ProviderKind = "openai-compatible" | "anthropic" | "gemini";
 
@@ -284,7 +288,9 @@ async function decryptPayload(payload: EncryptedPayload, serviceKey: string): Pr
   return new TextDecoder().decode(plain);
 }
 
-type JobRow = { id: string; user_id: string; trigger_key: string; kind: string };
+type JobRow = { id: string; user_id: string; trigger_key: string; kind: string; payload?: EncryptedPayload };
+type PendingItem = BridgeItem & { sourcePath: string; claimPath: string; rows: Record<string, Record<string, unknown>>; notifiedRules?: string[] };
+type ScanProgress = { kind: string; items: PendingItem[]; attempts: number };
 type SubscriptionRow = { endpoint: string; p256dh: string; auth: string };
 type BridgeItem = { id: string; type: string; payload: string; createdAt: string };
 
@@ -416,17 +422,28 @@ Deno.serve(async (req: Request) => {
   const job = claimed[0];
   if (!job) return new Response("already claimed", { status: 200 });
 
-  const finish = (status: "done" | "failed", note: string) => rest(`push_jobs?id=eq.${encodeURIComponent(job.id)}`, {
+  const finish = (status: "done" | "failed" | "pending", note: string) => rest(`push_jobs?id=eq.${encodeURIComponent(job.id)}`, {
     method: "PATCH",
-    body: JSON.stringify({ status, result_note: note.slice(0, 300), updated_at: new Date().toISOString() }),
+    body: JSON.stringify({ status, ...(status === "pending" ? { execute_at: new Date(Date.now() + 60_000).toISOString() } : {}), result_note: note.slice(0, 300), updated_at: new Date().toISOString() }),
   }).catch(() => undefined);
 
   // pg_net 的请求超时只有几秒：必须立即响应，重活放进 waitUntil 后台继续。
   const runJob = async (): Promise<void> => {
+  let progress: ScanProgress = { kind: "bridge_scan", items: [], attempts: 0 };
+  const checkpoint = async () => {
+    const saved = await rest(`push_jobs?id=eq.${encodeURIComponent(job.id)}`, {
+      method: "PATCH", body: JSON.stringify({ payload: await encryptJobPayload(JSON.stringify(progress), payloadKey), updated_at: new Date().toISOString() }),
+    });
+    if (!saved.ok) throw new Error(`checkpoint http ${saved.status}`);
+  };
   try {
+    if (job.payload && payloadKey) progress = { ...progress, ...JSON.parse(await decryptPayload(job.payload, payloadKey)) };
+    progress.attempts += 1;
+    if (payloadKey) await checkpoint();
     const configResponse = await rest(
       `push_bridge_config?user_id=eq.${encodeURIComponent(job.user_id)}&select=rules,cloud_config,rule_runs,daily_count,shortcut_actions&limit=1`,
     );
+    if (!configResponse.ok) throw new Error(`bridge config http ${configResponse.status}`);
     const configRows = configResponse.ok ? await configResponse.json() as BridgeConfigRow[] : [];
     const config = configRows[0];
     if (!config?.cloud_config) {
@@ -444,46 +461,53 @@ Deno.serve(async (req: Request) => {
       await finish("done", "cloud config incomplete");
       return;
     }
-    const storageHeaders = { apikey: cloudKey, Authorization: `Bearer ${cloudKey}` };
+    const storageHeaders: Record<string, string> = { apikey: cloudKey, ...(!cloudKey.startsWith("sb_") ? { Authorization: `Bearer ${cloudKey}` } : {}) };
 
     const listResponse = await fetch(`${cloudUrl}/storage/v1/object/list/${BACKUP_BUCKET}`, {
       method: "POST",
       headers: { ...storageHeaders, "Content-Type": "application/json" },
       body: JSON.stringify({ prefix: INBOX_PREFIX, limit: 20, offset: 0, sortBy: { column: "name", order: "asc" } }),
     });
-    const objects = listResponse.ok ? await listResponse.json() as { name?: string }[] : [];
-    const fileNames = (Array.isArray(objects) ? objects : [])
-      .map(obj => String(obj.name ?? ""))
+    if (!listResponse.ok) throw new Error(`inbox http ${listResponse.status}: ${(await listResponse.text()).slice(0, 100)}`);
+    const objects = await listResponse.json() as { name?: string }[];
+    const fileNames = (Array.isArray(objects) ? objects : []).map(obj => String(obj.name ?? ""))
       .filter(name => name && !name.endsWith("/") && name !== ".emptyFolderPlaceholder");
-    if (fileNames.length === 0) {
-      await finish("done", "inbox empty (client handled)");
-      return;
-    }
-
-    const items: BridgeItem[] = [];
     for (const name of fileNames) {
       const path = `${INBOX_PREFIX}${name}`;
-      try {
-        const objectResponse = await fetch(`${cloudUrl}/storage/v1/object/${BACKUP_BUCKET}/${path}`, { headers: storageHeaders });
-        if (!objectResponse.ok) continue;
-        const text = await objectResponse.text();
-        // 删除即认领：只有真正删掉（2xx）才有权处理；404=客户端已取走，其他失败留待下次，防重复触发
-        const deleteResponse = await fetch(`${cloudUrl}/storage/v1/object/${BACKUP_BUCKET}/${path}`, { method: "DELETE", headers: storageHeaders });
-        if (!deleteResponse.ok) continue;
-        const item = parseBridgeItem(name, text);
-        if (item) items.push(item);
-      } catch {
-        // 单条失败不阻塞
+      if (progress.items.some(item => item.sourcePath === path)) continue;
+      const response = await fetch(`${cloudUrl}/storage/v1/object/${BACKUP_BUCKET}/${path}`, { headers: storageHeaders });
+      if (response.status === 404) continue;
+      if (!response.ok) throw new Error(`inbox object http ${response.status}`);
+      const parsed = parseBridgeItem(name, await response.text());
+      if (!parsed) continue;
+      progress.items.push({ ...parsed, sourcePath: path, claimPath: `bridge-inflight/${job.id}/${name}`, rows: {} });
+      await checkpoint(); // Save ownership intent before touching the original object.
+    }
+    const items: PendingItem[] = [];
+    for (const item of progress.items) {
+      const claimed = await fetch(`${cloudUrl}/storage/v1/object/${BACKUP_BUCKET}/${item.claimPath}`, { headers: storageHeaders });
+      if (!claimed.ok) {
+        const claimDetail = await claimed.text();
+        if (claimed.status !== 404 && !(claimed.status === 400 && /not found/i.test(claimDetail))) throw new Error(`inflight read http ${claimed.status}`);
+        const moved = await fetch(`${cloudUrl}/storage/v1/object/move`, {
+          method: "POST", headers: { ...storageHeaders, "Content-Type": "application/json" },
+          body: JSON.stringify({ bucketId: BACKUP_BUCKET, sourceKey: item.sourcePath, destinationKey: item.claimPath }),
+        });
+        if (!moved.ok) {
+          const detail = await moved.text();
+          if (moved.status === 404 || (moved.status === 400 && /not found/i.test(detail))) continue; // Client already claimed it.
+          throw new Error(`inbox claim http ${moved.status}: ${detail.slice(0, 100)}`);
+        }
       }
+      items.push(item);
     }
-    items.sort((a, b) => a.id.localeCompare(b.id));
-    if (items.length === 0) {
-      await finish("done", "no parsable items");
-      return;
-    }
+    progress.items = items;
+    await checkpoint();
+    if (!items.length) { await finish("done", "inbox empty (client handled)"); return; }
 
     const subsResponse = await rest(`push_subscriptions?user_id=eq.${encodeURIComponent(job.user_id)}&select=endpoint,p256dh,auth`);
-    const subs = subsResponse.ok ? await subsResponse.json() as SubscriptionRow[] : [];
+    if (!subsResponse.ok) throw new Error(`subscriptions http ${subsResponse.status}`);
+    const subs = await subsResponse.json() as SubscriptionRow[];
 
     const vapidResponse = await rest("push_server_config?id=eq.main&select=vapid_public_key,vapid_private_key&limit=1");
     const vapidRows = vapidResponse.ok ? await vapidResponse.json() as { vapid_public_key: string; vapid_private_key: string }[] : [];
@@ -494,9 +518,19 @@ Deno.serve(async (req: Request) => {
     const pushErrors: string[] = [];
 
     const sendPush = async (title: string, bodyText: string, tag: string) => {
-      if (!vapid || subs.length === 0) return;
+      if (subs.length === 0) return;
+      if (subs.some(sub => sub.endpoint.startsWith("shell:"))) {
+        try {
+          const response = await fetch(`${supabaseUrl}/realtime/v1/api/broadcast`, {
+            method: "POST", headers: restHeaders,
+            body: JSON.stringify({ messages: [{ topic: `shellpush:${job.user_id}`, event: "notify", payload: { title, body: bodyText.slice(0, 80), tag, url: "/" } }] }),
+          });
+          if (!response.ok) pushErrors.push(`shell http ${response.status}`);
+        } catch (err) { pushErrors.push(String(err).slice(0, 80)); }
+      }
       const message = JSON.stringify({ title, body: bodyText.slice(0, 80), tag, url: "/" });
       for (const sub of subs) {
+        if (sub.endpoint.startsWith("shell:") || !vapid) continue;
         try {
           const status = await sendWebPushRaw(sub, message, vapid, 3600);
           if (status === 404 || status === 410) {
@@ -676,7 +710,8 @@ Deno.serve(async (req: Request) => {
       const response = await rest(
         `push_bridge_snapshots?user_id=eq.${encodeURIComponent(job.user_id)}&rule_id=eq.${encodeURIComponent(ruleId)}&select=rule_id,payload&limit=1`,
       );
-      const rows = response.ok ? await response.json() as SnapshotRow[] : [];
+      if (!response.ok) throw new Error(`snapshot http ${response.status}`);
+      const rows = await response.json() as SnapshotRow[];
       let parsed: RuleSnapshot | null = null;
       if (rows[0]) {
         try {
@@ -696,41 +731,89 @@ Deno.serve(async (req: Request) => {
     // daily_count 照常记账，仅作统计与排查。
     let dailyCount = config.daily_count?.day === today ? Number(config.daily_count.count) || 0 : 0;
 
-    const outboxRows: Record<string, unknown>[] = [];
+    const commitRow = async (row: Record<string, unknown>) => {
+      const response = await rest("push_outbox?on_conflict=id", {
+        method: "POST", headers: { Prefer: "resolution=ignore-duplicates" }, body: JSON.stringify([row]),
+      });
+      if (!response.ok) throw new Error(`outbox http ${response.status}`);
+      const meta = row.meta as { executed?: boolean; ruleId?: string; ranAt?: string; chat?: { characterName?: string } };
+      if (meta.executed && meta.ruleId && meta.ranAt) ruleRuns[meta.ruleId] = meta.ranAt;
+    };
+    const saveRow = async (item: PendingItem, key: string, row: Record<string, unknown>) => {
+      item.rows[key] = row;
+      await checkpoint();
+      await commitRow(row);
+    };
+    const deliverPendingShortcut = async (row: Record<string, unknown>) => {
+      const meta = row.meta as Record<string, unknown>;
+      const pending = meta.pendingShortcutDelivery as { commandId: string; actionName: string; email?: { commandId: string; resultUrl: string; actionId: string; actionName: string; args: Record<string, unknown> } } | undefined;
+      if (!pending) return;
+      const delivered = pending.email
+        ? await deliverBridgeShortcutEmailViaSite(job.user_id, pending.email)
+        : await deliverShortcutCommand(pending.commandId, pending.actionName);
+      if (!delivered.ok) throw new Error(delivered.note);
+      meta.shortcutNote = `${String(meta.shortcutNote || "")}；${delivered.note}`;
+      delete meta.pendingShortcutDelivery;
+      const updated = await rest(`push_outbox?id=eq.${encodeURIComponent(String(row.id))}`, { method: "PATCH", body: JSON.stringify({ meta }) });
+      if (!updated.ok) throw new Error(`shortcut outbox http ${updated.status}`);
+      await checkpoint();
+
+    };
+    const sendReplyPreview = async (item: PendingItem, rule: ServerBridgeRule, row: Record<string, unknown>) => {
+      if (!row.raw_text || !rule.chat || item.notifiedRules?.includes(rule.id)) return;
+      const errorsBefore = pushErrors.length;
+      let parts = splitResponseForPushPreview(String(row.raw_text)).slice(0, 6);
+      if (!parts.length) parts = ["发来一条消息"];
+      for (let index = 0; index < parts.length; index += 1) {
+        if (index > 0) await sleep(800);
+        await sendPush(rule.chat.characterName || "小手机", parts[index], `bridge-${item.id}-${rule.id}-${index}`);
+      }
+      if (pushErrors.length > errorsBefore) throw new Error(pushErrors.slice(errorsBefore).join(" | "));
+      item.notifiedRules = [...(item.notifiedRules || []), rule.id];
+      await checkpoint();
+    };
     let generated = 0;
 
     for (const item of items) {
+      const event: BridgeItem = { id: item.id, type: item.type, payload: item.payload, createdAt: item.createdAt };
       const matched = rules.filter(rule => rule.matchType === "*" || rule.matchType === item.type);
       if (matched.length === 0) {
-        outboxRows.push({
-          id: `out_${crypto.randomUUID()}`,
+        await saveRow(item, "archive", item.rows.archive || {
+          id: await bridgeOutboxId("archive", item.id),
           user_id: job.user_id,
           job_id: job.id,
           session_id: null,
           trigger_key: job.trigger_key,
           raw_text: "",
-          meta: { kind: "bridge", item, feedNote: "仅存档（无匹配规则，服务端处理）" },
+          meta: { kind: "bridge", item: event, feedNote: "仅存档（无匹配规则，服务端处理）" },
         });
         continue;
       }
 
       for (const rule of matched) {
+        const cached = item.rows[rule.id];
+        if (cached) {
+          await commitRow(cached);
+          await sendReplyPreview(item, rule, cached);
+          await deliverPendingShortcut(cached);
+          continue;
+        }
         const cooldownMs = Math.max(0, Number(rule.cooldownMinutes) || 0) * 60_000;
         const lastRun = ruleRuns[rule.id] ? Date.parse(ruleRuns[rule.id]) : 0;
         if (cooldownMs > 0 && Date.now() - lastRun < cooldownMs) {
-          outboxRows.push({
-            id: `out_${crypto.randomUUID()}`,
+          await saveRow(item, rule.id, {
+            id: await bridgeOutboxId(rule.id, item.id),
             user_id: job.user_id,
             job_id: job.id,
             session_id: null,
             trigger_key: job.trigger_key,
             raw_text: "",
-            meta: { kind: "bridge", item, ruleId: rule.id, ruleName: rule.name, feedNote: `「${rule.name}」还在触发间隔内，这次只存档（服务端）` },
+            meta: { kind: "bridge", item: event, ruleId: rule.id, ruleName: rule.name, feedNote: `「${rule.name}」还在触发间隔内，这次只存档（服务端）` },
           });
           continue;
         }
 
-        ruleRuns[rule.id] = new Date().toISOString();
+        const ranAt = new Date().toISOString();
 
         let processed = item.payload;
         const bridgeChatMessageId = rule.chat
@@ -749,6 +832,17 @@ Deno.serve(async (req: Request) => {
               // 加工失败退回原始 payload
             }
           }
+        }
+
+        let replyRaw = "";
+        if (rule.chat?.requestReply) {
+          const snapshot = await loadSnapshot(rule.id);
+          if (!snapshot?.replyRequest) throw new Error(`reply snapshot missing: ${rule.id}`);
+          const bodyJson = substituteSentinel(JSON.stringify(snapshot.replyRequest.body), BRIDGE_EVENT_SENTINEL, processed);
+          replyRaw = await callLlm(snapshot.replyRequest, bodyJson, 300_000);
+          if (!replyRaw) throw new Error("model returned an empty reply");
+          dailyCount += 1;
+          generated += 1;
         }
 
         if (rule.notify) {
@@ -774,22 +868,6 @@ Deno.serve(async (req: Request) => {
           }
         }
 
-        let replyRaw = "";
-        if (rule.chat?.requestReply) {
-          const snapshot = await loadSnapshot(rule.id);
-          if (snapshot?.replyRequest && subs.length > 0) {
-            try {
-              const bodyJson = substituteSentinel(JSON.stringify(snapshot.replyRequest.body), BRIDGE_EVENT_SENTINEL, processed);
-              replyRaw = await callLlm(snapshot.replyRequest, bodyJson, 300_000);
-              if (replyRaw) {
-                dailyCount += 1;
-                generated += 1;
-              }
-            } catch {
-              replyRaw = "";
-            }
-          }
-        }
 
         // 角色离线自主调用：回复里输出【快捷动作：名称】即按目录匹配执行，
         // 标记从正文剥离（不进聊天记录）。每次生成最多执行一个。
@@ -973,66 +1051,42 @@ Deno.serve(async (req: Request) => {
           }
         }
 
-        const outboxId = `out_${crypto.randomUUID()}`;
+        const outboxId = await bridgeOutboxId(rule.id, item.id);
         const outboxMeta: Record<string, unknown> = {
           kind: "bridge",
-          item,
+          item: { id: item.id, type: item.type, payload: item.payload, createdAt: item.createdAt },
           ...(bridgeChatMessageId ? { chatMessageId: bridgeChatMessageId } : {}),
           ruleId: rule.id,
           ruleName: rule.name,
           executed: true,
-          ranAt: ruleRuns[rule.id],
+          ranAt,
           processedText: processed,
           chat: rule.chat ?? null,
           deferredActions: rule.deferredActions ?? [],
           ...(shortcutNote ? { shortcutNote } : {}),
           ...(executedShortcutMarker ? { shortcutMarker: executedShortcutMarker } : {}),
           reply: replyRaw ? (await loadSnapshot(rule.id))?.reply ?? null : null,
+          ...((deferredAiShortcutCommandId || deferredAiShortcutEmail) ? { pendingShortcutDelivery: {
+            commandId: deferredAiShortcutCommandId, actionName: deferredAiShortcutName,
+            ...(deferredAiShortcutEmail ? { email: deferredAiShortcutEmail } : {}),
+          } } : {}),
         };
-        const stored = await rest("push_outbox", {
-          method: "POST",
-          body: JSON.stringify([{
-            id: outboxId,
-            user_id: job.user_id,
-            job_id: job.id,
-            session_id: rule.chat?.sessionId ?? null,
-            trigger_key: job.trigger_key,
-            raw_text: deliveredViaWeixin ? "" : replyRaw,
-            meta: outboxMeta,
-          }]),
-        });
-        if (!stored.ok) {
-          pushErrors.push(`outbox http ${stored.status}`);
-        }
+        const row = {
+          id: outboxId, user_id: job.user_id, job_id: job.id,
+          session_id: rule.chat?.sessionId ?? null, trigger_key: job.trigger_key,
+          raw_text: deliveredViaWeixin ? "" : replyRaw, meta: outboxMeta,
+        };
+        item.rows[rule.id] = row;
+        await checkpoint(); // Keep the generated result across Storage/REST failures.
+        await commitRow(row);
 
-        if (stored.ok && replyRaw && rule.chat && !deliveredViaWeixin) {
-          let parts = splitResponseForPushPreview(replyRaw).slice(0, 6);
-          if (parts.length === 0) parts = ["发来一条消息"];
-          for (let index = 0; index < parts.length; index += 1) {
-            if (index > 0) await sleep(800);
-            await sendPush(rule.chat.characterName || "小手机", parts[index], `bridge-${item.id}-${rule.id}-${index}`);
-          }
-        }
+        await sendReplyPreview(item, rule, row);
 
-        if (stored.ok && (deferredAiShortcutCommandId || deferredAiShortcutEmail)) {
-          const delivered = deferredAiShortcutEmail
-            ? await deliverBridgeShortcutEmailViaSite(job.user_id, deferredAiShortcutEmail)
-            : await deliverShortcutCommand(deferredAiShortcutCommandId, deferredAiShortcutName);
-          shortcutNote = shortcutNote ? `${shortcutNote}；${delivered.note}` : delivered.note;
-          outboxMeta.shortcutNote = shortcutNote;
-          await rest(`push_outbox?id=eq.${encodeURIComponent(outboxId)}`, {
-            method: "PATCH",
-            body: JSON.stringify({ meta: outboxMeta }),
-          }).catch(() => undefined);
-          if (!delivered.ok) pushErrors.push(delivered.note);
-        }
+        await deliverPendingShortcut(row);
       }
     }
 
-    if (outboxRows.length > 0) {
-      await rest("push_outbox", { method: "POST", body: JSON.stringify(outboxRows) });
-    }
-    await rest(`push_bridge_config?user_id=eq.${encodeURIComponent(job.user_id)}`, {
+    const savedConfig = await rest(`push_bridge_config?user_id=eq.${encodeURIComponent(job.user_id)}`, {
       method: "PATCH",
       body: JSON.stringify({
         rule_runs: ruleRuns,
@@ -1041,9 +1095,28 @@ Deno.serve(async (req: Request) => {
       }),
     });
 
+    if (!savedConfig.ok) throw new Error(`bridge progress http ${savedConfig.status}`);
+    for (const item of items) {
+      const removed = await fetch(`${cloudUrl}/storage/v1/object/${BACKUP_BUCKET}/${item.claimPath}`, { method: "DELETE", headers: storageHeaders });
+      if (!removed.ok && removed.status !== 404) throw new Error(`inbox cleanup http ${removed.status}`);
+    }
+    progress.items = [];
+    await checkpoint();
+    const remaining = await fetch(`${cloudUrl}/storage/v1/object/list/${BACKUP_BUCKET}`, {
+      method: "POST", headers: { ...storageHeaders, "Content-Type": "application/json" },
+      body: JSON.stringify({ prefix: INBOX_PREFIX, limit: 1, offset: 0 }),
+    });
+    if (!remaining.ok) throw new Error(`inbox recheck http ${remaining.status}`);
+    const more = await remaining.json() as { name?: string }[];
+    if (more.some(obj => obj.name && obj.name !== ".emptyFolderPlaceholder")) {
+      progress.attempts = 0;
+      await checkpoint();
+      await finish("pending", "more inbox events queued");
+      return;
+    }
     await finish("done", `items ${items.length}, generated ${generated}${pushErrors.length ? `, push errors: ${pushErrors.slice(0, 3).join(" | ")}` : ""}`);
   } catch (err) {
-    await finish("failed", err instanceof Error ? err.message : String(err));
+    await finish(progress.attempts < 3 ? "pending" : "failed", err instanceof Error ? err.message : String(err));
   }
   };
 
