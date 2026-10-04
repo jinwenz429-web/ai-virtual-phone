@@ -240,6 +240,45 @@ function stripVisionParts(messages: LlmRequestMessage[]): LlmRequestMessage[] {
     });
 }
 
+// A damaged image in stored history must not break every subsequent text turn.
+// Validate at the shared boundary so ordinary and native-tool requests agree.
+function normalizeVisionImageUrl(value: string): string | null {
+    const url = value.trim();
+    if (!/^data:/i.test(url)) {
+        try {
+            const parsed = new URL(url);
+            return parsed.protocol === "https:" || parsed.protocol === "http:" ? url : null;
+        } catch {
+            return null;
+        }
+    }
+    const match = /^data:(image\/[^;,\s]+)(?:;[^;,]+)*;base64,([\s\S]+)$/i.exec(url);
+    if (!match) return null;
+    const data = match[2].replace(/\s/g, "");
+    if (!data || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) return null;
+    try {
+        atob(data);
+    } catch {
+        return null;
+    }
+    const paddedData = data.padEnd(Math.ceil(data.length / 4) * 4, "=");
+    return `data:${match[1].toLowerCase()};base64,${paddedData}`;
+}
+
+function normalizeVisionParts(messages: LlmRequestMessage[]): LlmRequestMessage[] {
+    return messages.map((message) => {
+        if (!Array.isArray(message.content)) return message;
+        const content = message.content.map((part): LLMContentPart => {
+            if (part.type === "text") return part;
+            const url = normalizeVisionImageUrl(part.image_url.url);
+            return url
+                ? { ...part, image_url: { ...part.image_url, url } }
+                : { type: "text", text: "[图片不可用：图片数据格式无效]" };
+        });
+        return { ...message, content };
+    });
+}
+
 export function buildProviderRequest(
     config: ApiConfig,
     preset: PresetConfig | null,
@@ -259,7 +298,7 @@ export function buildProviderRequest(
 
     // 图像识别关闭时的总闸：无论哪条路径塞入了 image_url part，一律降级为
     // "[图片]" 文本，避免不支持视觉的模型（如 DeepSeek）收到 multipart 返回 400。
-    const guardedMessages = config.enableImageRecognition === true ? messages : stripVisionParts(messages);
+    const guardedMessages = config.enableImageRecognition === true ? normalizeVisionParts(messages) : stripVisionParts(messages);
     const providerMessages = ensureProviderHasUserMessage(normalizeNativeToolMessageAdjacency(guardedMessages));
 
     const request = providerKind === "anthropic"
