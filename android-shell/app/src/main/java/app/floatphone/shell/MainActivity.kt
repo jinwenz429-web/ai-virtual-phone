@@ -465,6 +465,7 @@ html[data-float-shell-mobile="1"] .splash-shell-wrap .phone-frame {
 
                     function markShellSubscriptionGate() {
                         try {
+                            var gateKey = 'push_account_subscribed_v1';
                             var value = JSON.stringify({ subscribed: true, checkedAt: Date.now() });
                             var openGate = indexedDB.open('AiPhoneKvDB');
                             openGate.onsuccess = function() {
@@ -474,18 +475,40 @@ html[data-float-shell-mobile="1"] .splash-shell-wrap .phone-frame {
                                         db.close();
                                         return;
                                     }
-                                    var tx = db.transaction('entries', 'readwrite');
-                                    tx.objectStore('entries').put({
-                                        key: 'push_account_subscribed_v1',
-                                        value: value
-                                    });
-                                    tx.oncomplete = function() {
-                                        try { db.close(); } catch (_) {}
-                                        var marker = 'float-shell-personal-push-gate-v1';
-                                        if (sessionStorage.getItem(marker) !== '1') {
-                                            sessionStorage.setItem(marker, '1');
-                                            window.setTimeout(function() { location.reload(); }, 80);
+                                    var readTx = db.transaction('entries', 'readonly');
+                                    var readReq = readTx.objectStore('entries').get(gateKey);
+                                    readReq.onsuccess = function() {
+                                        var alreadySubscribed = false;
+                                        try {
+                                            var current = readReq.result && readReq.result.value
+                                                ? JSON.parse(readReq.result.value)
+                                                : null;
+                                            alreadySubscribed = current && current.subscribed === true;
+                                        } catch (_) {}
+                                        if (alreadySubscribed) {
+                                            try { db.close(); } catch (_) {}
+                                            return;
                                         }
+                                        try {
+                                            var writeTx = db.transaction('entries', 'readwrite');
+                                            writeTx.objectStore('entries').put({ key: gateKey, value: value });
+                                            writeTx.oncomplete = function() {
+                                                try { db.close(); } catch (_) {}
+                                                var marker = 'float-shell-personal-push-gate-v1';
+                                                if (sessionStorage.getItem(marker) !== '1') {
+                                                    sessionStorage.setItem(marker, '1');
+                                                    window.setTimeout(function() { location.reload(); }, 80);
+                                                }
+                                            };
+                                            writeTx.onerror = function() {
+                                                try { db.close(); } catch (_) {}
+                                            };
+                                        } catch (_) {
+                                            try { db.close(); } catch (_) {}
+                                        }
+                                    };
+                                    readReq.onerror = function() {
+                                        try { db.close(); } catch (_) {}
                                     };
                                 } catch (_) {
                                     try { db.close(); } catch (_) {}
