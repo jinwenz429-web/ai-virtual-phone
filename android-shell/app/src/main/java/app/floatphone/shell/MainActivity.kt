@@ -35,7 +35,7 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         val SITE_URL: String = BuildConfig.SITE_URL
-        const val VERSION = "1.0.5"
+        const val VERSION = "1.0.6"
         /** 来电接听等场景的站内深链（必须以 SITE_URL 开头，否则忽略） */
         const val EXTRA_OPEN_URL = "open_url"
     }
@@ -136,6 +136,7 @@ class MainActivity : AppCompatActivity() {
                 if (Uri.parse(url).host == Uri.parse(SITE_URL).host) {
                     forceShellMobileLayout(view)
                     installShellKeyboardAnchor(view)
+                    syncPersonalPushConfig(view)
                     cleanLegacyPwaState(view)
                 }
             }
@@ -443,6 +444,176 @@ html[data-float-shell-mobile="1"] .splash-shell-wrap .phone-frame {
     }
 
     /**
+     * 从当前站点自己的 IndexedDB 读取个人 Supabase 推送配置并交给原生服务。
+     * 这段逻辑放在 APK 内，网页无需为此重新部署；即使 Netlify 没配置共享
+     * SUPABASE_* 环境变量，壳也能直连用户已经部署好的个人 Supabase。
+     */
+    private fun syncPersonalPushConfig(view: WebView) {
+        view.evaluateJavascript(
+            """(function() {
+                try {
+                    if (!window.AndroidShell || typeof window.AndroidShell.configurePersonalPush !== 'function') return;
+                    var stateKey = 'personal_push_cloud_state_v1';
+                    var backupKey = 'ai_phone_cloud_backup_config_v1';
+
+                    function normalizeUrl(value) {
+                        var text = String(value || '').trim().replace(/\/+$/, '');
+                        if (!text) return '';
+                        if (!/^https?:\/\//i.test(text)) text = 'https://' + text;
+                        return text;
+                    }
+
+                    function markShellSubscriptionGate() {
+                        try {
+                            var value = JSON.stringify({ subscribed: true, checkedAt: Date.now() });
+                            var openGate = indexedDB.open('AiPhoneKvDB');
+                            openGate.onsuccess = function() {
+                                var db = openGate.result;
+                                try {
+                                    if (!db.objectStoreNames.contains('entries')) {
+                                        db.close();
+                                        return;
+                                    }
+                                    var tx = db.transaction('entries', 'readwrite');
+                                    tx.objectStore('entries').put({
+                                        key: 'push_account_subscribed_v1',
+                                        value: value
+                                    });
+                                    tx.oncomplete = function() {
+                                        try { db.close(); } catch (_) {}
+                                        var marker = 'float-shell-personal-push-gate-v1';
+                                        if (sessionStorage.getItem(marker) !== '1') {
+                                            sessionStorage.setItem(marker, '1');
+                                            window.setTimeout(function() { location.reload(); }, 80);
+                                        }
+                                    };
+                                } catch (_) {
+                                    try { db.close(); } catch (_) {}
+                                }
+                            };
+                        } catch (_) {}
+                    }
+
+                    function applyConfig(stateRaw, backupRaw) {
+                        try {
+                            var state = stateRaw ? JSON.parse(stateRaw) : null;
+                            var backup = backupRaw ? JSON.parse(backupRaw) : null;
+                            if (!state || state.enabled !== true || !backup) {
+                                if (typeof window.AndroidShell.clearPersonalPush === 'function') window.AndroidShell.clearPersonalPush();
+                                return;
+                            }
+                            var url = normalizeUrl(backup.url);
+                            var stateUrl = normalizeUrl(state.url);
+                            var serviceKey = String(backup.key || '').trim();
+                            var projectRef = '';
+                            try { projectRef = new URL(url).hostname.split('.')[0] || ''; } catch (_) {}
+                            if (!url || !serviceKey || stateUrl !== url || String(state.projectRef || '') !== projectRef) {
+                                if (typeof window.AndroidShell.clearPersonalPush === 'function') window.AndroidShell.clearPersonalPush();
+                                return;
+                            }
+
+                            var gateway = url + '/functions/v1/ai-phone-push';
+                            var headers = {
+                                'x-ai-phone-service-key': serviceKey,
+                                'x-ai-phone-origin': location.origin
+                            };
+                            fetch(gateway + '?action=shell-config', { headers: headers, cache: 'no-store' })
+                                .then(function(response) {
+                                    return response.json().catch(function() { return {}; }).then(function(data) {
+                                        if (!response.ok || !data || data.ok !== true || !data.anonKey) {
+                                            throw new Error('shell config unavailable');
+                                        }
+                                        return data;
+                                    });
+                                })
+                                .then(function(data) {
+                                    var userId = String(data.userId || 'owner');
+                                    return fetch(gateway + '?action=subscribe', {
+                                        method: 'POST',
+                                        headers: Object.assign({ 'Content-Type': 'application/json' }, headers),
+                                        body: JSON.stringify({
+                                            endpoint: 'shell:' + userId,
+                                            keys: { p256dh: 'shell', auth: 'shell' }
+                                        }),
+                                        cache: 'no-store'
+                                    }).then(function(response) {
+                                        if (!response.ok) throw new Error('shell subscription failed');
+                                        return {
+                                            supabaseUrl: normalizeUrl(data.supabaseUrl || url),
+                                            anonKey: String(data.anonKey || '').trim(),
+                                            userId: userId
+                                        };
+                                    });
+                                })
+                                .then(function(config) {
+                                    if (!config.supabaseUrl || !config.anonKey) return;
+                                    window.AndroidShell.configurePersonalPush(
+                                        config.supabaseUrl,
+                                        config.anonKey,
+                                        config.userId
+                                    );
+                                    markShellSubscriptionGate();
+                                })
+                                .catch(function() {
+                                    // 短暂断网或边缘节点传播时保留上一次原生配置，后台服务会继续重连。
+                                });
+                        } catch (_) {}
+                    }
+
+                    var lsState = null;
+                    var lsBackup = null;
+                    try {
+                        lsState = localStorage.getItem(stateKey);
+                        lsBackup = localStorage.getItem(backupKey);
+                    } catch (_) {}
+                    if (lsState && lsBackup) {
+                        applyConfig(lsState, lsBackup);
+                        return;
+                    }
+                    if (!window.indexedDB) return;
+
+                    var open = indexedDB.open('AiPhoneKvDB');
+                    open.onsuccess = function() {
+                        var db = open.result;
+                        try {
+                            if (!db.objectStoreNames.contains('entries')) {
+                                db.close();
+                                return;
+                            }
+                            var tx = db.transaction('entries', 'readonly');
+                            var store = tx.objectStore('entries');
+                            var stateReq = store.get(stateKey);
+                            var backupReq = store.get(backupKey);
+                            var stateValue = lsState;
+                            var backupValue = lsBackup;
+                            var done = 0;
+                            function finish() {
+                                done += 1;
+                                if (done < 2) return;
+                                applyConfig(stateValue, backupValue);
+                                try { db.close(); } catch (_) {}
+                            }
+                            stateReq.onsuccess = function() {
+                                stateValue = (stateReq.result && stateReq.result.value) || stateValue;
+                                finish();
+                            };
+                            stateReq.onerror = finish;
+                            backupReq.onsuccess = function() {
+                                backupValue = (backupReq.result && backupReq.result.value) || backupValue;
+                                finish();
+                            };
+                            backupReq.onerror = finish;
+                        } catch (_) {
+                            try { db.close(); } catch (_) {}
+                        }
+                    };
+                } catch (_) {}
+            })()""".trimIndent(),
+            null,
+        )
+    }
+
+    /**
      * APK 壳不使用 PWA Service Worker：原生 PushService 已负责离线消息，
      * 而旧 SW 的 cache-first 静态缓存可能让新 HTML 与旧 JS/CSS 混用。
      * 这里只清站点自己的 SW + ai-phone-pwa-* CacheStorage，不碰 Cookie、
@@ -509,6 +680,17 @@ html[data-float-shell-mobile="1"] .splash-shell-wrap .phone-frame {
     inner class ShellBridge {
         @JavascriptInterface
         fun getVersion(): String = VERSION
+
+        /** 把个人 Supabase 推送配置同步给原生前台服务；仅保存在本应用私有目录。 */
+        @JavascriptInterface
+        fun configurePersonalPush(url: String, key: String, userId: String) {
+            PushService.configurePersonalPush(this@MainActivity, url, key, userId)
+        }
+
+        @JavascriptInterface
+        fun clearPersonalPush() {
+            PushService.clearPersonalPush(this@MainActivity)
+        }
 
         /** 打开本应用的系统设置页（引导用户关电池限制、开自启动）。 */
         @JavascriptInterface

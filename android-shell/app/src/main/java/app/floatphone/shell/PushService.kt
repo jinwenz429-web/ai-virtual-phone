@@ -38,13 +38,53 @@ class PushService : Service() {
         private const val CH_MESSAGES = "shell_messages"
         private const val CH_CALLS = "shell_calls"
         private const val NOTIF_FG_ID = 1
+        private const val PREFS = "shell_push"
+        private const val PREF_PERSONAL_URL = "personal_url"
+        private const val PREF_PERSONAL_KEY = "personal_key"
+        private const val PREF_PERSONAL_USER_ID = "personal_user_id"
+        private const val ACTION_REFRESH = "app.floatphone.shell.push.REFRESH"
         private var running = false
+
+        private fun launch(context: Context, intent: Intent) {
+            if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent)
+            else context.startService(intent)
+        }
 
         fun start(context: Context) {
             if (running) return
-            val intent = Intent(context, PushService::class.java)
-            if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent)
-            else context.startService(intent)
+            launch(context, Intent(context, PushService::class.java))
+        }
+
+        fun configurePersonalPush(context: Context, url: String, key: String, userId: String) {
+            val cleanUrl = url.trim().trimEnd('/')
+            val cleanKey = key.trim()
+            val cleanUserId = userId.trim().ifEmpty { "owner" }
+            if (cleanUrl.isEmpty() || cleanKey.isEmpty()) return
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putString(PREF_PERSONAL_URL, cleanUrl)
+                .putString(PREF_PERSONAL_KEY, cleanKey)
+                .putString(PREF_PERSONAL_USER_ID, cleanUserId)
+                .apply()
+            launch(
+                context,
+                Intent(context, PushService::class.java).setAction(ACTION_REFRESH),
+            )
+        }
+
+        fun clearPersonalPush(context: Context) {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .remove(PREF_PERSONAL_URL)
+                .remove(PREF_PERSONAL_KEY)
+                .remove(PREF_PERSONAL_USER_ID)
+                .apply()
+            if (running) {
+                launch(
+                    context,
+                    Intent(context, PushService::class.java).setAction(ACTION_REFRESH),
+                )
+            }
         }
     }
 
@@ -58,6 +98,7 @@ class PushService : Service() {
     private var msgSeq = 2
     private var notifId = 100
     private var shellSubRegistered = false
+    @Volatile private var refreshRequested = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -69,7 +110,14 @@ class PushService : Service() {
         thread(name = "shell-push-loop") { connectionLoop() }
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_REFRESH) {
+            shellSubRegistered = false
+            refreshRequested = true
+            socket?.cancel()
+        }
+        return START_STICKY
+    }
 
     override fun onDestroy() {
         stopped = true
@@ -82,25 +130,45 @@ class PushService : Service() {
     private fun connectionLoop() {
         var backoffSec = 5L
         while (!stopped) {
+            refreshRequested = false
             val config = fetchConfig()
             if (config == null) {
                 updateKeepAlive("未登录或站点不可达，稍后重试")
-                sleepSec(60); continue
+                sleepRetrySec(60)
+                continue
             }
             updateKeepAlive("已连接，等待角色消息")
             val closedNormally = runSocket(config)
             if (stopped) break
             updateKeepAlive("连接断开，重连中…")
-            sleepSec(if (closedNormally) 3 else backoffSec)
+            sleepRetrySec(if (closedNormally) 3 else backoffSec)
             backoffSec = (backoffSec * 2).coerceAtMost(120)
             if (closedNormally) backoffSec = 5
         }
     }
 
-    private data class PushConfig(val supabaseUrl: String, val anonKey: String, val userId: String)
+    private data class PushConfig(val supabaseUrl: String, val realtimeKey: String, val userId: String)
 
-    /** 借 WebView 的登录 Cookie 调站点接口获取连接参数。 */
-    private fun fetchConfig(): PushConfig? = runCatching {
+    /**
+     * 优先使用网页同步过来的个人 Supabase 配置。这样 APK 推送不再依赖
+     * Netlify 站点的 SUPABASE_* 环境变量；旧的站点账号通道保留作兼容兜底。
+     *
+     * 个人模式只持久化 Supabase anon key；service_role 仅在网页内短暂用于
+     * 向个人网关换取公开连接参数，不落到原生 SharedPreferences。
+     */
+    private fun fetchConfig(): PushConfig? = readPersonalConfig() ?: fetchSiteConfig()
+
+    private fun readPersonalConfig(): PushConfig? {
+        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val url = prefs.getString(PREF_PERSONAL_URL, null)?.trim()?.trimEnd('/').orEmpty()
+        val key = prefs.getString(PREF_PERSONAL_KEY, null)?.trim().orEmpty()
+        val userId = prefs.getString(PREF_PERSONAL_USER_ID, null)?.trim().orEmpty().ifEmpty { "owner" }
+        if (url.isEmpty() || key.isEmpty()) return null
+        return PushConfig(url, key, userId)
+    }
+
+    /** 借 WebView 的登录 Cookie 调站点接口获取连接参数（旧站点模式兼容）。 */
+    private fun fetchSiteConfig(): PushConfig? = runCatching {
         val cookie = CookieManager.getInstance().getCookie(MainActivity.SITE_URL) ?: return null
 
         fun getJson(path: String): JSONObject? {
@@ -123,7 +191,7 @@ class PushService : Service() {
         val url = online.optString("supabaseUrl")
         val key = online.optString("anonKey")
         if (url.isEmpty() || key.isEmpty()) return null
-        registerShellSubscription(cookie, userId)
+        registerSiteShellSubscription(cookie, userId)
         PushConfig(url.trimEnd('/'), key, userId)
     }.getOrNull()
 
@@ -132,17 +200,10 @@ class PushService : Service() {
      * 作用是让离线消息排期的"账号已订阅"门控放行，并让服务端知道
      * 要往 shellpush 频道广播；服务端不会对它做 Web Push 投递。
      */
-    private fun registerShellSubscription(cookie: String, userId: String) {
+    private fun registerSiteShellSubscription(cookie: String, userId: String) {
         if (shellSubRegistered) return
         runCatching {
-            val body = JSONObject()
-                .put("endpoint", "shell:$userId")
-                .put(
-                    "keys",
-                    JSONObject().put("p256dh", "shell").put("auth", "shell"),
-                )
-                .toString()
-                .toRequestBody("application/json".toMediaType())
+            val body = shellSubscriptionBody(userId)
             val request = Request.Builder()
                 .url("${MainActivity.SITE_URL}/api/push/subscribe")
                 .header("Cookie", cookie)
@@ -154,10 +215,19 @@ class PushService : Service() {
         }
     }
 
+    private fun shellSubscriptionBody(userId: String) = JSONObject()
+        .put("endpoint", "shell:$userId")
+        .put(
+            "keys",
+            JSONObject().put("p256dh", "shell").put("auth", "shell"),
+        )
+        .toString()
+        .toRequestBody("application/json".toMediaType())
+
     /** 跑一条 WebSocket 直到断开；返回是否属于正常关闭。 */
     private fun runSocket(config: PushConfig): Boolean {
         val wsUrl = config.supabaseUrl.replaceFirst("http", "ws") +
-            "/realtime/v1/websocket?apikey=${config.anonKey}&vsn=1.0.0"
+            "/realtime/v1/websocket?apikey=${config.realtimeKey}&vsn=1.0.0"
         val topic = "realtime:shellpush:${config.userId}"
         val lock = Object()
         var normal = false
@@ -358,6 +428,15 @@ class PushService : Service() {
             .build()
         getSystemService(NotificationManager::class.java).notify(notifId++, notification)
         if (notifId > 400) notifId = 100
+    }
+
+    private fun sleepRetrySec(sec: Long) {
+        val deadline = System.currentTimeMillis() + sec * 1000
+        while (!stopped && !refreshRequested && System.currentTimeMillis() < deadline) {
+            val remaining = (deadline - System.currentTimeMillis()).coerceAtMost(500)
+            if (remaining <= 0) break
+            runCatching { Thread.sleep(remaining) }
+        }
     }
 
     private fun sleepSec(sec: Long) {

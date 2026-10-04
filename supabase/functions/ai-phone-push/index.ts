@@ -552,6 +552,12 @@ Deno.serve(async (request: Request) => {
   };
 
   try {
+    if (action === "shell-config" && request.method === "GET") {
+      const anonKey = Deno.env.get("SUPABASE_ANON_KEY") || "";
+      if (!anonKey) return json({ ok: false, error: "Supabase anon key 缺失。" }, 503);
+      return json({ ok: true, supabaseUrl, anonKey, userId: OWNER_ID });
+    }
+
     if (action === "health") {
       const response = await rest("push_server_config?select=id&limit=1");
       if (!response.ok) throw new Error("离线推送数据库尚未初始化。");
