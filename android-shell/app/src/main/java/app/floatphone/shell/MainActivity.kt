@@ -35,7 +35,7 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         val SITE_URL: String = BuildConfig.SITE_URL
-        const val VERSION = "1.0.4"
+        const val VERSION = "1.0.5"
         /** 来电接听等场景的站内深链（必须以 SITE_URL 开头，否则忽略） */
         const val EXTRA_OPEN_URL = "open_url"
     }
@@ -127,6 +127,7 @@ class MainActivity : AppCompatActivity() {
                 super.onPageCommitVisible(view, url)
                 if (Uri.parse(url).host == Uri.parse(SITE_URL).host) {
                     forceShellMobileLayout(view)
+                    installShellKeyboardAnchor(view)
                 }
             }
 
@@ -134,6 +135,7 @@ class MainActivity : AppCompatActivity() {
                 super.onPageFinished(view, url)
                 if (Uri.parse(url).host == Uri.parse(SITE_URL).host) {
                     forceShellMobileLayout(view)
+                    installShellKeyboardAnchor(view)
                     cleanLegacyPwaState(view)
                 }
             }
@@ -286,12 +288,8 @@ html[data-float-shell-mobile="1"] .phone-shell-wrap {
   margin-inline: 0 !important;
   margin-top: calc(-1 * var(--status-bar-drop, 0px)) !important;
   gap: 0 !important;
-  position: relative !important;
-  top: calc(-1 * var(--mobile-keyboard-lift, 0px));
-  transform: none !important;
-  -webkit-transform: none !important;
-  will-change: auto !important;
-  transition: top 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+  transform-origin: top left;
+  transform: translate3d(0, calc(-1 * var(--mobile-keyboard-lift, 0px)), 0);
 }
 html[data-float-shell-mobile="1"] .phone-shell-wrap .phone-case,
 html[data-float-shell-mobile="1"] .phone-shell-wrap .phone-frame {
@@ -328,34 +326,6 @@ html[data-float-shell-mobile="1"] .splash-shell-wrap .phone-frame {
   width: 100vw !important;
 }
 
-/* Huawei WebView 114 在 fixed 弹窗 + transformed ancestor/动画合成层下会出现
-   局部不重绘。APK 壳不需要这层动画，优先保证整块弹窗稳定绘制。 */
-html[data-float-shell-mobile="1"] .modal-overlay,
-html[data-float-shell-mobile="1"] [data-ui="modal"] {
-  position: fixed !important;
-  inset: 0 !important;
-  width: auto !important;
-  height: auto !important;
-  transform: none !important;
-  -webkit-transform: none !important;
-  will-change: auto !important;
-  animation: none !important;
-}
-html[data-float-shell-mobile="1"] .modal-dialog,
-html[data-float-shell-mobile="1"] .modal-sheet,
-html[data-float-shell-mobile="1"] .modal-expand,
-html[data-float-shell-mobile="1"] [data-ui="modal-dialog"] {
-  box-sizing: border-box !important;
-  transform: none !important;
-  -webkit-transform: none !important;
-  will-change: auto !important;
-  animation: none !important;
-}
-html[data-float-shell-mobile="1"] [aria-modal="true"] {
-  will-change: auto !important;
-  animation: none !important;
-}
-
 @media (max-width: 373px) {
   html[data-float-shell-mobile="1"] .icon-grid,
   html[data-float-shell-mobile="1"] .dock {
@@ -375,6 +345,97 @@ html[data-float-shell-mobile="1"] [aria-modal="true"] {
 }
 `;
                     (document.head || document.documentElement).appendChild(style);
+                } catch (_) {}
+            })()""".trimIndent(),
+            null,
+        )
+    }
+
+    /**
+     * 键盘弹出时，如果用户原本就在聊天底部附近，就让消息列表继续锚定到底部。
+     * 只调整聊天滚动容器，不移动整个 phone shell；用户正在上翻历史时不干预。
+     */
+    private fun installShellKeyboardAnchor(view: WebView) {
+        view.evaluateJavascript(
+            """(function() {
+                try {
+                    if (window.__floatShellKeyboardAnchorInstalled) return;
+                    window.__floatShellKeyboardAnchorInstalled = true;
+
+                    var viewport = window.visualViewport;
+                    var shouldPinBottom = false;
+                    var settleTimers = [];
+
+                    function isEditable(element) {
+                        if (!element || !element.tagName) return false;
+                        var tag = String(element.tagName).toUpperCase();
+                        if (tag === 'TEXTAREA') return true;
+                        if (tag === 'INPUT') {
+                            var type = String(element.type || 'text').toLowerCase();
+                            return ['button', 'checkbox', 'radio', 'range', 'color', 'file', 'submit', 'reset'].indexOf(type) < 0;
+                        }
+                        return element.isContentEditable === true;
+                    }
+
+                    function visibleChatScroller() {
+                        var el = document.querySelector('.chat-scroll-anchored');
+                        if (!el) return null;
+                        var rect = el.getBoundingClientRect();
+                        if (rect.width <= 0 || rect.height <= 0) return null;
+                        return el;
+                    }
+
+                    function isNearBottom(el) {
+                        return (el.scrollHeight - el.scrollTop - el.clientHeight) < 160;
+                    }
+
+                    function clearSettleTimers() {
+                        settleTimers.forEach(function(id) { window.clearTimeout(id); });
+                        settleTimers = [];
+                    }
+
+                    function pinBottomOnce() {
+                        if (!shouldPinBottom) return;
+                        var el = visibleChatScroller();
+                        if (!el) return;
+                        el.scrollTop = el.scrollHeight;
+                    }
+
+                    function settleBottom() {
+                        if (!shouldPinBottom) return;
+                        clearSettleTimers();
+                        window.requestAnimationFrame(function() {
+                            pinBottomOnce();
+                            window.requestAnimationFrame(pinBottomOnce);
+                        });
+                        settleTimers.push(window.setTimeout(pinBottomOnce, 80));
+                        settleTimers.push(window.setTimeout(pinBottomOnce, 180));
+                        settleTimers.push(window.setTimeout(pinBottomOnce, 320));
+                    }
+
+                    document.addEventListener('focusin', function(event) {
+                        if (!isEditable(event.target)) return;
+                        var el = visibleChatScroller();
+                        shouldPinBottom = !!el && isNearBottom(el);
+                        if (shouldPinBottom) settleBottom();
+                    }, true);
+
+                    document.addEventListener('focusout', function() {
+                        window.setTimeout(function() {
+                            if (!isEditable(document.activeElement)) {
+                                shouldPinBottom = false;
+                                clearSettleTimers();
+                            }
+                        }, 0);
+                    }, true);
+
+                    function handleViewportResize() {
+                        if (!shouldPinBottom || !isEditable(document.activeElement)) return;
+                        settleBottom();
+                    }
+
+                    if (viewport) viewport.addEventListener('resize', handleViewportResize);
+                    window.addEventListener('resize', handleViewportResize);
                 } catch (_) {}
             })()""".trimIndent(),
             null,
