@@ -195,6 +195,28 @@ async function sendWebPushRaw(
   vapid: { publicKey: string; privateKey: string; subject: string },
   ttlSeconds = 3600,
 ): Promise<number> {
+  if (subscription.endpoint.startsWith("shell:")) {
+    const supabaseUrl = (Deno.env.get("SUPABASE_URL") || "").replace(/\/$/, "");
+    const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
+    const message = JSON.parse(payload);
+    const response = await fetch(`${supabaseUrl}/realtime/v1/api/broadcast`, {
+      method: "POST",
+      headers: {
+        apikey: serviceKey,
+        Authorization: `Bearer ${serviceKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messages: [{
+          topic: `shellpush:${OWNER_ID}`,
+          event: "notify",
+          payload: message.notification || message,
+        }],
+      }),
+    });
+    await response.text().catch(() => "");
+    return response.status;
+  }
   const body = await encryptWebPushPayload(subscription.p256dh, subscription.auth, payload);
   const authorization = await buildVapidAuth(
     subscription.endpoint,
