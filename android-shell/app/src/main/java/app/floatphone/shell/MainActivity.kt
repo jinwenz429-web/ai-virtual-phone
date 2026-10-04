@@ -18,6 +18,7 @@ import android.webkit.JavascriptInterface
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
@@ -35,7 +36,7 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         val SITE_URL: String = BuildConfig.SITE_URL
-        const val VERSION = "1.0.1"
+        const val VERSION = "1.0.2"
         /** 来电接听等场景的站内深链（必须以 SITE_URL 开头，否则忽略） */
         const val EXTRA_OPEN_URL = "open_url"
     }
@@ -100,8 +101,21 @@ class MainActivity : AppCompatActivity() {
             databaseEnabled = true
             mediaPlaybackRequiresUserGesture = false
             allowFileAccess = false
+
+            // 显式固定现代移动页的 viewport 行为，避免旧版/厂商 WebView
+            // 使用实现默认值后出现宽度重排、整体缩放或裁切。
+            useWideViewPort = true
+            loadWithOverviewMode = true
+            layoutAlgorithm = WebSettings.LayoutAlgorithm.NORMAL
+            textZoom = 100
+            setSupportZoom(false)
+            builtInZoomControls = false
+            displayZoomControls = false
+
             userAgentString = "$userAgentString FloatShell/$VERSION"
         }
+        // 0 lets WebView derive the scale from the page's viewport meta tag and density.
+        webView.setInitialScale(0)
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, false)
 
@@ -121,6 +135,13 @@ class MainActivity : AppCompatActivity() {
                 return runCatching {
                     startActivity(Intent(Intent.ACTION_VIEW, url)); true
                 }.getOrDefault(true)
+            }
+
+            override fun onPageFinished(view: WebView, url: String) {
+                super.onPageFinished(view, url)
+                if (Uri.parse(url).host == Uri.parse(SITE_URL).host) {
+                    cleanLegacyPwaState(view)
+                }
             }
         }
 
@@ -216,6 +237,52 @@ class MainActivity : AppCompatActivity() {
         val target = intent?.getStringExtra(EXTRA_OPEN_URL) ?: return null
         intent.removeExtra(EXTRA_OPEN_URL)
         return target.takeIf { it.startsWith(SITE_URL) }
+    }
+
+    /**
+     * APK 壳不使用 PWA Service Worker：原生 PushService 已负责离线消息，
+     * 而旧 SW 的 cache-first 静态缓存可能让新 HTML 与旧 JS/CSS 混用。
+     * 这里只清站点自己的 SW + ai-phone-pwa-* CacheStorage，不碰 Cookie、
+     * localStorage、IndexedDB 或登录状态；若确实清到了旧状态，本会话只刷新一次。
+     */
+    private fun cleanLegacyPwaState(view: WebView) {
+        view.evaluateJavascript(
+            """(function() {
+                try {
+                    var marker = 'float-shell-pwa-cleanup-v1';
+                    var alreadyReloaded = sessionStorage.getItem(marker) === '1';
+                    var swCleanup = ('serviceWorker' in navigator)
+                        ? navigator.serviceWorker.getRegistrations()
+                            .then(function(regs) {
+                                return Promise.all(regs.map(function(reg) {
+                                    if (reg.scope.indexOf(location.origin + '/') !== 0) return false;
+                                    return reg.unregister().catch(function() { return false; });
+                                }));
+                            })
+                            .catch(function() { return []; })
+                        : Promise.resolve([]);
+                    var cacheCleanup = ('caches' in window)
+                        ? caches.keys()
+                            .then(function(keys) {
+                                return Promise.all(keys
+                                    .filter(function(key) { return key.indexOf('ai-phone-pwa-') === 0; })
+                                    .map(function(key) {
+                                        return caches.delete(key).catch(function() { return false; });
+                                    }));
+                            })
+                            .catch(function() { return []; })
+                        : Promise.resolve([]);
+                    Promise.all([swCleanup, cacheCleanup]).then(function(groups) {
+                        var changed = groups[0].some(Boolean) || groups[1].some(Boolean);
+                        if (changed && !alreadyReloaded) {
+                            sessionStorage.setItem(marker, '1');
+                            location.reload();
+                        }
+                    });
+                } catch (_) {}
+            })()""".trimIndent(),
+            null,
+        )
     }
 
     private fun ensurePushService() {
