@@ -5,6 +5,7 @@ import { ArrowRight } from "lucide-react";
 
 import { AccountGate } from "@/components/auth/account-gate";
 import { CloudBackupScheduler } from "@/components/cloud-backup-scheduler";
+import { ChatPluginBootstrap } from "@/components/chat-plugin-bootstrap";
 import { RealityBridgeScheduler } from "@/components/reality-bridge-scheduler";
 import { MediaMaintenanceScheduler } from "@/components/media-maintenance-scheduler";
 import { DesktopShell } from "./desktop-shell";
@@ -12,6 +13,8 @@ import { OfflinePushRevampAnnouncement } from "./offline-push-revamp-announcemen
 import { SplashAnimation } from "./splash-animation";
 import { MusicProvider } from "@/lib/music-context";
 import { hydrateKvDb, isKvHydrated } from "@/lib/kv-db";
+import { hydrateChatStorage, isChatStorageHydrated } from "@/lib/chat-storage";
+import { hydrateSettingsDb, isSettingsHydrated } from "@/lib/settings-db";
 import { getThemeAssetMap, readThemeProfile } from "@/lib/theme-storage";
 import { resolveActiveIconSkins, type ThemeProfile } from "@/lib/theme-types";
 import { hasPendingMcpOAuthCallback } from "@/lib/tool-executor";
@@ -241,11 +244,17 @@ export function MainApp() {
     void navigator.storage?.persist?.().catch(() => {});
 
     void (async () => {
-      await hydrateKvDb();
+      try {
+        await Promise.all([hydrateKvDb(), hydrateChatStorage(), hydrateSettingsDb()]);
+      } catch (error) {
+        console.warn("[MainApp] local data initialization failed:", error);
+        if (!cancelled) setKvHydrateFailed(true);
+        return;
+      }
       if (cancelled) return;
       // 水合失败绝不放行：此时所有 KV 数据（设置/绑定/线下记录等）在内存里都是
       // 空的，进入后任何一次保存都会拿空数据整包覆盖 IndexedDB 里的真实历史。
-      if (!isKvHydrated()) {
+      if (!isKvHydrated() || !isChatStorageHydrated() || !isSettingsHydrated()) {
         setKvHydrateFailed(true);
         return;
       }
@@ -291,7 +300,7 @@ export function MainApp() {
         <div style={{ maxWidth: 340, textAlign: "center" }}>
           <div style={{ fontSize: 17, fontWeight: 700, marginBottom: 12 }}>本机数据暂时读取失败</div>
           <div style={{ fontSize: 13, lineHeight: 1.8, opacity: 0.75, marginBottom: 20 }}>
-            浏览器的本地数据库（IndexedDB）没能打开。数据本身还在，为了避免在读不到数据的状态下继续使用把历史记录覆盖掉，应用先暂停进入。
+            本机数据库没能完整读取，暂时无法确认已有数据的状态。为避免把未读出的历史记录覆盖掉，应用先暂停进入。
             <br />可以先重试；仍然不行的话，试试关掉本站的其他标签页、重启浏览器，或确认没有开无痕/隐私模式。
           </div>
           <button
@@ -308,6 +317,7 @@ export function MainApp() {
 
   return (
     <AccountGate>
+      {hydrated ? <ChatPluginBootstrap /> : null}
       {!splashDismissed ? (
         <SplashScreen ready={hydrated} onEnter={() => setSplashDismissed(true)} />
       ) : (

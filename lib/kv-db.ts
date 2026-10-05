@@ -43,11 +43,14 @@ function migrateLegacyKey(lsKey: string): void {
     if (typeof window === "undefined") return;
     const raw = localStorage.getItem(lsKey);
     if (raw === null) return;
-    if (_cache.get(lsKey) !== raw) {
-        _cache.set(lsKey, raw);
-        kvDb.entries.put({ key: lsKey, value: raw }).catch(() => {});
-    }
-    localStorage.removeItem(lsKey);
+    _cache.set(lsKey, raw);
+    // A cached value is not proof that the previous database write succeeded.
+    // Keep the legacy copy until this write commits, including on retries.
+    kvDb.entries.put({ key: lsKey, value: raw }).then(() => {
+        removeLegacyLocalStorageKeyIfValue(lsKey, raw);
+    }).catch(err => {
+        console.warn("[KvDB] legacy migration failed; original retained:", lsKey, err);
+    });
 }
 
 function migrateLegacyPrefix(prefix: string): void {
@@ -133,10 +136,9 @@ export function hydrateKvDb(): Promise<void> {
         for (const lsKey of _fixedKeys) {
             const raw = localStorage.getItem(lsKey);
             if (raw === null) continue;
-            if (_cache.get(lsKey) !== raw) {
-                batch.push({ key: lsKey, value: raw });
-                _cache.set(lsKey, raw);
-            }
+            // A prior attempt may have populated the cache but failed to persist.
+            batch.push({ key: lsKey, value: raw });
+            _cache.set(lsKey, raw);
             removeKeys.add(lsKey);
         }
 
@@ -146,16 +148,17 @@ export function hydrateKvDb(): Promise<void> {
             if (!k || !matchesDynamicPrefix(k)) continue;
             const raw = localStorage.getItem(k);
             if (raw !== null) {
-                if (_cache.get(k) !== raw) {
-                    batch.push({ key: k, value: raw });
-                    _cache.set(k, raw);
-                }
+                batch.push({ key: k, value: raw });
+                _cache.set(k, raw);
                 removeKeys.add(k);
             }
         }
 
         if (batch.length > 0) await kvDb.entries.bulkPut(batch);
-        for (const k of removeKeys) localStorage.removeItem(k);
+        for (const k of removeKeys) {
+            const committed = batch.find(entry => entry.key === k);
+            if (committed) removeLegacyLocalStorageKeyIfValue(k, committed.value);
+        }
     })().then(() => {
         _hydrated = true;
         _hydrateError = null;
