@@ -59,7 +59,7 @@ export async function initChatDb(): Promise<{
                 (await chatDb.messages.count()) +
                 (await chatDb.sessions.count()) +
                 (await chatDb.contacts.count());
-            if (existingCount > 0) {
+            if (existingCount > 0 && [LS_MESSAGES_KEY, LS_SESSIONS_KEY, LS_CONTACTS_KEY].every(key => window.localStorage.getItem(key) === null)) {
                 window.localStorage.setItem(LS_MIGRATED_FLAG, "1");
                 const [messages, sessions, contacts] = await Promise.all([
                     chatDb.messages.toArray(),
@@ -71,6 +71,9 @@ export async function initChatDb(): Promise<{
             }
         } catch (err) {
             console.warn("[ChatDB] Pre-migration IndexedDB check failed:", err);
+            // A failed read does not establish that the database is empty.
+            // Never continue migration from an empty legacy store in this state.
+            throw err;
         }
 
         // First run after migration: move localStorage data → IndexedDB
@@ -83,15 +86,17 @@ export async function initChatDb(): Promise<{
             const lsSessions: ChatSession[] = rawSessions ? JSON.parse(rawSessions) : [];
             const lsContacts: ChatContact[] = rawContacts ? JSON.parse(rawContacts) : [];
 
-            if (lsMessages.length > 0) {
-                await chatDb.messages.bulkPut(lsMessages);
-            }
-            if (lsSessions.length > 0) {
-                await chatDb.sessions.bulkPut(lsSessions);
-            }
-            if (lsContacts.length > 0) {
-                await chatDb.contacts.bulkPut(lsContacts);
-            }
+            const [messages, sessions, contacts] = await chatDb.transaction("rw", chatDb.messages, chatDb.sessions, chatDb.contacts, async () => {
+                const addMissing = async <T extends { id: string }>(table: Dexie.Table<T, string>, incoming: T[]) => {
+                    const existing = new Set((await table.toArray()).map(item => item.id));
+                    const missing = incoming.filter(item => !existing.has(item.id));
+                    if (missing.length) await table.bulkPut(missing);
+                };
+                await addMissing(chatDb.messages, lsMessages);
+                await addMissing(chatDb.sessions, lsSessions);
+                await addMissing(chatDb.contacts, lsContacts);
+                return Promise.all([chatDb.messages.toArray(), chatDb.sessions.toArray(), chatDb.contacts.toArray()]);
+            });
 
             // Mark as migrated and remove old localStorage data
             window.localStorage.setItem(LS_MIGRATED_FLAG, "1");
@@ -101,14 +106,10 @@ export async function initChatDb(): Promise<{
 
             console.log(`[ChatDB] Migrated from localStorage: ${lsMessages.length} messages, ${lsSessions.length} sessions, ${lsContacts.length} contacts`);
 
-            return { messages: lsMessages, sessions: lsSessions, contacts: lsContacts };
+            return { messages, sessions, contacts };
         } catch (err) {
-            console.error("[ChatDB] Migration failed, falling back to localStorage:", err);
-            // If migration fails, load from localStorage as fallback
-            const fallbackMessages: ChatMessage[] = safeParse(window.localStorage.getItem(LS_MESSAGES_KEY));
-            const fallbackSessions: ChatSession[] = safeParse(window.localStorage.getItem(LS_SESSIONS_KEY));
-            const fallbackContacts: ChatContact[] = safeParse(window.localStorage.getItem(LS_CONTACTS_KEY));
-            return { messages: fallbackMessages, sessions: fallbackSessions, contacts: fallbackContacts };
+            console.error("[ChatDB] Migration failed; original data retained:", err);
+            throw err;
         }
     }
 

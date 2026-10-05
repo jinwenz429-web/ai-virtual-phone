@@ -39,8 +39,13 @@ let _regexes: RegexConfig[] | null = null;
 let _hydrated = false;
 let _presetsWriteQueue: Promise<void> = Promise.resolve();
 
-function safeParse<T>(raw: string | null): T[] {
-    try { return raw ? JSON.parse(raw) : []; } catch { return []; }
+function parseLegacyArray<T>(raw: string | null): T[] {
+    if (raw === null) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed) || parsed.some(item => !item || typeof item !== "object" || typeof item.id !== "string")) {
+        throw new Error("[SettingsDB] Legacy settings are malformed; original retained");
+    }
+    return parsed as T[];
 }
 
 // ── Hydration (must be called once at startup) ──
@@ -61,7 +66,7 @@ export async function hydrateSettingsDb(): Promise<void> {
                 (await settingsDb.presets.count()) +
                 (await settingsDb.worldBooks.count()) +
                 (await settingsDb.regexes.count());
-            if (existingCount > 0) {
+            if (existingCount > 0 && [LS_PRESETS_KEY, LS_WORLDBOOKS_KEY, LS_REGEXES_KEY].every(key => window.localStorage.getItem(key) === null)) {
                 window.localStorage.setItem(LS_MIGRATED_FLAG, "1");
                 const [presets, worldBooks, regexes] = await Promise.all([
                     settingsDb.presets.toArray(),
@@ -77,17 +82,28 @@ export async function hydrateSettingsDb(): Promise<void> {
             }
         } catch (err) {
             console.warn("[SettingsDB] Pre-migration IndexedDB check failed:", err);
+            throw err;
         }
 
         // Migrate from localStorage → IndexedDB
         try {
-            const lsPresets: PresetConfig[] = safeParse(window.localStorage.getItem(LS_PRESETS_KEY));
-            const lsWorldBooks: WorldBookConfig[] = safeParse(window.localStorage.getItem(LS_WORLDBOOKS_KEY));
-            const lsRegexes: RegexConfig[] = safeParse(window.localStorage.getItem(LS_REGEXES_KEY));
+            const lsPresets = parseLegacyArray<PresetConfig>(window.localStorage.getItem(LS_PRESETS_KEY));
+            const lsWorldBooks = parseLegacyArray<WorldBookConfig>(window.localStorage.getItem(LS_WORLDBOOKS_KEY));
+            const lsRegexes = parseLegacyArray<RegexConfig>(window.localStorage.getItem(LS_REGEXES_KEY));
 
-            if (lsPresets.length > 0) await settingsDb.presets.bulkPut(lsPresets);
-            if (lsWorldBooks.length > 0) await settingsDb.worldBooks.bulkPut(lsWorldBooks);
-            if (lsRegexes.length > 0) await settingsDb.regexes.bulkPut(lsRegexes);
+            // All stores commit together. Also complete a partial legacy migration
+            // without overwriting records already present in the database.
+            const [presets, worldBooks, regexes] = await settingsDb.transaction("rw", settingsDb.presets, settingsDb.worldBooks, settingsDb.regexes, async () => {
+                const addMissing = async <T extends { id: string }>(table: Dexie.Table<T, string>, incoming: T[]) => {
+                    const existing = new Set((await table.toArray()).map(item => item.id));
+                    const missing = incoming.filter(item => !existing.has(item.id));
+                    if (missing.length) await table.bulkPut(missing);
+                };
+                await addMissing(settingsDb.presets, lsPresets);
+                await addMissing(settingsDb.worldBooks, lsWorldBooks);
+                await addMissing(settingsDb.regexes, lsRegexes);
+                return Promise.all([settingsDb.presets.toArray(), settingsDb.worldBooks.toArray(), settingsDb.regexes.toArray()]);
+            });
 
             window.localStorage.setItem(LS_MIGRATED_FLAG, "1");
             window.localStorage.removeItem(LS_PRESETS_KEY);
@@ -96,14 +112,12 @@ export async function hydrateSettingsDb(): Promise<void> {
 
             console.log(`[SettingsDB] Migrated: ${lsPresets.length} presets, ${lsWorldBooks.length} worldBooks, ${lsRegexes.length} regexes`);
 
-            _presets = lsPresets;
-            _worldBooks = lsWorldBooks;
-            _regexes = lsRegexes;
+            _presets = presets;
+            _worldBooks = worldBooks;
+            _regexes = regexes;
         } catch (err) {
-            console.error("[SettingsDB] Migration failed, falling back to localStorage:", err);
-            _presets = safeParse(window.localStorage.getItem(LS_PRESETS_KEY));
-            _worldBooks = safeParse(window.localStorage.getItem(LS_WORLDBOOKS_KEY));
-            _regexes = safeParse(window.localStorage.getItem(LS_REGEXES_KEY));
+            console.error("[SettingsDB] Migration failed; original data retained:", err);
+            throw err;
         }
     } else {
         // Already migrated: load from IndexedDB
@@ -119,9 +133,9 @@ export async function hydrateSettingsDb(): Promise<void> {
             console.log(`[SettingsDB] Loaded: ${presets.length} presets, ${worldBooks.length} worldBooks, ${regexes.length} regexes`);
         } catch (err) {
             console.error("[SettingsDB] Failed to load from IndexedDB:", err);
-            _presets = [];
-            _worldBooks = [];
-            _regexes = [];
+            // Do not label a failed read as a successful empty snapshot: a
+            // subsequent settings save would clear the existing database.
+            throw err;
         }
     }
     _hydrated = true;

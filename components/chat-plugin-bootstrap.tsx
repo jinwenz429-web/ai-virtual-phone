@@ -2,7 +2,7 @@
 
 // components/chat-plugin-bootstrap.tsx
 // 聊天插件运行时启动引导：应用挂载后加载全部启用插件。
-// 放在根布局，保证插件的 hook 在用户进入聊天前就已注册。
+// 本机数据完整加载后由 MainApp 挂载，在用户进入聊天前注册 hook。
 
 import { useEffect } from "react";
 import { getChatPluginRuntime } from "@/lib/chat-plugin-runtime";
